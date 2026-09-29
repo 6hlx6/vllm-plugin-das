@@ -59,6 +59,8 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_AITER_W16A16_MOE_SHUFFLE: bool = True
     VLLM_HCU_USE_AITER_MOE_CONFIG: bool = True
     VLLM_HCU_MOONCAKE_TTFT_TRACE: bool = False
+    # Per-layer KV send on prefill. Default off keeps the bulk p_ready path.
+    VLLM_HCU_MOONCAKE_LAYERWISE: bool = False
     VLLM_HCU_DEEPEP_NUM_SMS: Optional[int] = None
     VLLM_HCU_DPSK_V4_DEEPEP_LL_USE_HCU_DISPATCH_API: bool = False
     VLLM_HCU_SHARED_EXPERTS_STREAM_FORCE: bool = False
@@ -376,6 +378,12 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # Emit Mooncake TTFT_EVENT DEBUG lines with wall-clock ts for PD TTFT analysis.
     "VLLM_HCU_MOONCAKE_TTFT_TRACE":
         lambda: (os.environ.get("VLLM_HCU_MOONCAKE_TTFT_TRACE", "False").lower() in
+                    ("true", "1")),
+
+    # Send each layer after it is computed. Decode still waits for all layers.
+    # kv_connector_extra_config["layerwise"] overrides this. Default off.
+    "VLLM_HCU_MOONCAKE_LAYERWISE":
+        lambda: (os.environ.get("VLLM_HCU_MOONCAKE_LAYERWISE", "False").lower() in
                     ("true", "1")),
 
     # Optional override for DeepEP Buffer.set_num_sms().

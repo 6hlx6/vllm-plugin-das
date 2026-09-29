@@ -1185,6 +1185,59 @@ def test_normalize_pp_layer_partition(mooncake):
     assert mooncake._normalize_pp_layer_partition(" 3, 5 ") == "3,5"
 
 
+def test_layerwise_switch_defaults_off_and_respects_extra_config(mooncake):
+    disabled = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(kv_connector_extra_config={})
+    )
+    assert mooncake.mooncake_layerwise_enabled(disabled) is False
+    enabled = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(
+            kv_connector_extra_config={"layerwise": True}
+        )
+    )
+    assert mooncake.mooncake_layerwise_enabled(enabled) is True
+    explicit_off = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(
+            kv_connector_extra_config={"layerwise": False}
+        )
+    )
+    assert mooncake.mooncake_layerwise_enabled(explicit_off) is False
+
+
+def test_region_belongs_to_attention_and_indexer(mooncake):
+    attn = mooncake.TransferRegion(
+        layer_name="model.layers.3.self_attn.attn",
+        layer_index=3,
+        base_addr=1,
+        block_len=8,
+        kv_block_len=8,
+    )
+    indexer = mooncake.TransferRegion(
+        layer_name="model.layers.3.indexer",
+        layer_index=3,
+        base_addr=2,
+        block_len=4,
+        kv_block_len=4,
+    )
+    other = mooncake.TransferRegion(
+        layer_name="model.layers.4.self_attn.attn",
+        layer_index=4,
+        base_addr=3,
+        block_len=8,
+        kv_block_len=8,
+    )
+    hook = "model.layers.3.self_attn.attn"
+    assert mooncake._region_belongs_to_layer(attn, hook)
+    assert mooncake._region_belongs_to_layer(indexer, hook)
+    assert not mooncake._region_belongs_to_layer(other, hook)
+
+
+def test_layerwise_notify_is_noop_when_disabled(mooncake):
+    worker = object.__new__(mooncake.MooncakeConnectorWorker)
+    worker.layerwise_enabled = False
+    worker.notify_layer_computed("model.layers.0.self_attn.attn")
+
+
 def test_pp_stage_range_matches_v21_pp1_and_custom(mooncake):
     assert mooncake._pp_stage_range(8, 0, 1, "3,5") == (0, 8)
     assert mooncake._pp_stage_range(8, 0, 2, "3,5") == (0, 3)
