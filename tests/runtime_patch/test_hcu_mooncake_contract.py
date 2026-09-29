@@ -1204,6 +1204,24 @@ def test_layerwise_switch_defaults_off_and_respects_extra_config(mooncake):
     assert mooncake.mooncake_layerwise_enabled(explicit_off) is False
 
 
+def test_layerwise_switch_reads_process_env_when_extra_omits_key(mooncake, monkeypatch):
+    cfg = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(kv_connector_extra_config={})
+    )
+    monkeypatch.setenv("VLLM_HCU_MOONCAKE_LAYERWISE", "1")
+    assert mooncake.mooncake_layerwise_enabled(cfg) is True
+    monkeypatch.setenv("VLLM_HCU_MOONCAKE_LAYERWISE", "0")
+    assert mooncake.mooncake_layerwise_enabled(cfg) is False
+    # extra_config still wins over the env var, including an explicit off.
+    forced_off = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(
+            kv_connector_extra_config={"layerwise": False}
+        )
+    )
+    monkeypatch.setenv("VLLM_HCU_MOONCAKE_LAYERWISE", "1")
+    assert mooncake.mooncake_layerwise_enabled(forced_off) is False
+
+
 def test_region_belongs_to_attention_and_indexer(mooncake):
     attn = mooncake.TransferRegion(
         layer_name="model.layers.3.self_attn.attn",

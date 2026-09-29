@@ -4,6 +4,7 @@
 # Modified by Hygon Information Technology Co., Ltd., 2026.
 import asyncio
 import logging
+import os
 import re
 import threading
 import time
@@ -185,13 +186,68 @@ def _layerwise_flag_enabled(value: Any) -> bool:
     return str(value).lower() in ("1", "true", "yes", "on")
 
 
-def mooncake_layerwise_enabled(vllm_config: VllmConfig) -> bool:
-    """Layerwise send switch. extra_config overrides the env var. Default off."""
-    kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
+def _extra_config_dict(kv_transfer_config: Any) -> dict[str, Any]:
     extra = getattr(kv_transfer_config, "kv_connector_extra_config", None) or {}
+    if isinstance(extra, dict):
+        return extra
+    try:
+        return dict(extra)
+    except (TypeError, ValueError):
+        return {}
+
+
+def _config_is_kv_producer(kv_transfer_config: Any) -> bool:
+    """Accept the string role and KVTransferConfig.is_kv_producer."""
+    if kv_transfer_config is None:
+        return False
+    prop = getattr(type(kv_transfer_config), "is_kv_producer", None)
+    if isinstance(prop, property):
+        try:
+            if kv_transfer_config.is_kv_producer:
+                return True
+        except Exception:
+            logger.debug("Mooncake kv_role property check failed", exc_info=True)
+    role = getattr(kv_transfer_config, "kv_role", None)
+    text = str(getattr(role, "value", role) or "").strip().lower()
+    return text in ("kv_producer", "kv_both")
+
+
+def mooncake_layerwise_enabled(vllm_config: VllmConfig) -> bool:
+    """Layerwise send switch. extra_config overrides the env var. Default off.
+
+    Workers often do not inherit VLLM_HCU_MOONCAKE_LAYERWISE. The pickled
+    kv_connector_extra_config is the source that reaches them.
+    """
+    kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
+    extra = _extra_config_dict(kv_transfer_config)
     if "layerwise" in extra:
         return _layerwise_flag_enabled(extra.get("layerwise"))
+    raw = os.environ.get("VLLM_HCU_MOONCAKE_LAYERWISE")
+    if raw is not None:
+        return _layerwise_flag_enabled(raw)
     return bool(henvs.VLLM_HCU_MOONCAKE_LAYERWISE)
+
+
+def _log_layerwise_decision(
+    where: str,
+    vllm_config: VllmConfig,
+    *,
+    enabled: bool,
+    producer: bool,
+) -> None:
+    kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
+    extra = _extra_config_dict(kv_transfer_config)
+    logger.info(
+        "Mooncake layerwise KV check where=%s enabled=%s producer=%s "
+        "role=%r extra=%s env=%r file=%s",
+        where,
+        enabled,
+        producer,
+        getattr(kv_transfer_config, "kv_role", None),
+        extra,
+        os.environ.get("VLLM_HCU_MOONCAKE_LAYERWISE"),
+        __file__,
+    )
 
 
 def _block_groups_from_alloc(blocks: Any) -> tuple[list[int], ...] | None:
@@ -962,8 +1018,19 @@ class MooncakeConnectorScheduler:
             vllm_config.kv_transfer_config.kv_role == "kv_consumer"
         )
         # Only the producer records alloc block ids. Consumers stay unchanged.
+        # Bulk path keeps the string role check. Layerwise also accepts the
+        # KVTransferConfig.is_kv_producer property.
+        producer_for_layerwise = self.is_kv_producer or _config_is_kv_producer(
+            vllm_config.kv_transfer_config
+        )
         self.layerwise_enabled = (
-            mooncake_layerwise_enabled(vllm_config) and self.is_kv_producer
+            mooncake_layerwise_enabled(vllm_config) and producer_for_layerwise
+        )
+        _log_layerwise_decision(
+            "scheduler",
+            vllm_config,
+            enabled=self.layerwise_enabled,
+            producer=producer_for_layerwise,
         )
         logger.info("Initializing Mooncake Transfer Engine Scheduler %s", engine_id)
 
@@ -1277,6 +1344,20 @@ class MooncakeConnectorWorker:
         assert (kv_transfer_config := vllm_config.kv_transfer_config)
         self.is_kv_producer: bool = kv_transfer_config.kv_role == "kv_producer"
         self.is_kv_consumer: bool = kv_transfer_config.kv_role == "kv_consumer"
+        # Decide before TransferEngine init so a later failure still leaves a log.
+        # Bulk send still uses is_kv_producer / is_kv_consumer above.
+        producer_for_layerwise = self.is_kv_producer or _config_is_kv_producer(
+            kv_transfer_config
+        )
+        self.layerwise_enabled = (
+            mooncake_layerwise_enabled(vllm_config) and producer_for_layerwise
+        )
+        _log_layerwise_decision(
+            "worker",
+            vllm_config,
+            enabled=self.layerwise_enabled,
+            producer=producer_for_layerwise,
+        )
         self.num_sender_workers = kv_transfer_config.kv_connector_extra_config.get(
             "num_workers", 10
         )
@@ -1390,9 +1471,6 @@ class MooncakeConnectorWorker:
         self.finished_sending_reqs: set[ReqId] = set()
         self.finished_recving_reqs: set[ReqId] = set()
         # Layerwise is off by default. Producers send per layer; consumers wait for FINISH.
-        self.layerwise_enabled = (
-            mooncake_layerwise_enabled(vllm_config) and self.is_kv_producer
-        )
         self._layerwise_lock = threading.Lock()
         self._layerwise_epoch = 0
         self._layerwise_computed: list[tuple[int, str, Any]] = []
@@ -2370,6 +2448,11 @@ class MooncakeConnectorWorker:
                     req_id=session["p_req_id"] or send_meta.p_req_id or None,
                 )
                 session["send_meta"].ttft_send_start_logged = True
+            logger.info(
+                "Mooncake layerwise send layer=%s descs=%s",
+                layer_index,
+                len(src_ptrs),
+            )
             future = self.sender_loop.run_in_executor(
                 self._sender_executor,
                 self._send_layer_blocks,
