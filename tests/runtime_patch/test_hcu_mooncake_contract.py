@@ -1250,6 +1250,92 @@ def test_region_belongs_to_attention_and_indexer(mooncake):
     assert not mooncake._region_belongs_to_layer(other, hook)
 
 
+def test_layerwise_alloc_fills_session_that_handshook_first(mooncake):
+    send_meta = mooncake.SendBlockMeta(
+        p_req_id="",
+        transfer_id="xfer-early",
+        local_block_ids=[],
+        ready=asyncio.Event(),
+    )
+    session = {
+        "send_meta": send_meta,
+        "block_ids": [],
+        "epoch": 0,
+        "p_req_id": "",
+        "prefill_done": False,
+    }
+    filled = mooncake._apply_alloc_to_layerwise_sessions(
+        {("xfer-early",): session},
+        {"xfer-early": (3, [[1, 2]], "req-1")},
+    )
+    assert filled is True
+    assert session["block_ids"] == [[1, 2]]
+    assert session["epoch"] == 3
+    assert session["p_req_id"] == "req-1"
+    assert session["prefill_done"] is False
+    # 已经有 block 的 session 保持不变，避免把正在发送的块表换掉。
+    again = mooncake._apply_alloc_to_layerwise_sessions(
+        {("xfer-early",): session},
+        {"xfer-early": (9, [[8]], "other")},
+    )
+    assert again is False
+    assert session["block_ids"] == [[1, 2]]
+
+
+def test_layerwise_notify_url_comes_from_request_params(mooncake):
+    assert mooncake._layerwise_notify_url(None) == ""
+    assert mooncake._layerwise_notify_url({}) == ""
+    assert (
+        mooncake._layerwise_notify_url(
+            {"layerwise_notify_url": "http://127.0.0.1:8001/notify"}
+        )
+        == "http://127.0.0.1:8001/notify"
+    )
+
+
+def test_layerwise_send_group_is_one_sync_write(mooncake):
+    class _Event:
+        def __init__(self):
+            self.synced = False
+
+        def synchronize(self):
+            self.synced = True
+
+    class _Stats:
+        def __init__(self):
+            self.records = []
+
+        def record_transfer(self, duration_s, total_bytes, num_descs):
+            self.records.append((total_bytes, num_descs))
+
+        def record_failed_transfer(self):
+            raise AssertionError("grouped send should succeed")
+
+    class _Engine:
+        def __init__(self):
+            self.sync_calls = []
+
+        def batch_transfer_sync_write(self, session, src, dst, lengths):
+            self.sync_calls.append((session, list(src), list(dst), list(lengths)))
+            return 0
+
+        def batch_transfer_async_write(self, *_args):
+            raise AssertionError("async write segfaults in this Mooncake build")
+
+    worker = object.__new__(mooncake.MooncakeConnectorWorker)
+    worker.engine = _Engine()
+    worker.xfer_stats = _Stats()
+    event = _Event()
+    ret = worker._send_layer_blocks(
+        event, "10.0.0.8:1", [10, 11], [20, 21], [64, 64]
+    )
+    assert ret == 0
+    assert event.synced is True
+    assert len(worker.engine.sync_calls) == 1
+    assert worker.engine.sync_calls[0][1:] == ([10, 11], [20, 21], [64, 64])
+    assert mooncake._LAYERWISE_SEND_GROUP == 8
+
+
 def test_layerwise_notify_is_noop_when_disabled(mooncake):
     worker = object.__new__(mooncake.MooncakeConnectorWorker)
     worker.layerwise_enabled = False
