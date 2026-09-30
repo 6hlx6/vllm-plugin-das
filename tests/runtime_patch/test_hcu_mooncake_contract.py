@@ -1293,6 +1293,62 @@ def test_layerwise_notify_url_comes_from_request_params(mooncake):
     )
 
 
+def test_layerwise_send_uses_async_write_not_device_sync(mooncake):
+    class _Event:
+        def __init__(self):
+            self.synced = False
+
+        def synchronize(self):
+            self.synced = True
+
+    class _Stats:
+        def __init__(self):
+            self.records = []
+            self.failures = 0
+
+        def record_transfer(self, duration_s, total_bytes, num_descs):
+            self.records.append((duration_s, total_bytes, num_descs))
+
+        def record_failed_transfer(self):
+            self.failures += 1
+
+    class _Engine:
+        def __init__(self):
+            self.sync_calls = 0
+            self.async_calls = []
+
+        def batch_transfer_sync_write(self, *_args):
+            self.sync_calls += 1
+            return 0
+
+        def batch_transfer_async_write(self, session, src, dst, lengths):
+            self.async_calls.append((session, list(src), list(dst), list(lengths)))
+            return 11
+
+        def get_batch_transfer_status(self, batch_ids):
+            assert batch_ids == [11]
+            return ["COMPLETED"]
+
+    worker = object.__new__(mooncake.MooncakeConnectorWorker)
+    worker.engine = _Engine()
+    worker.xfer_stats = _Stats()
+    worker._layerwise_async_missing_logged = False
+    event = _Event()
+    ret = worker._send_layer_blocks(event, "10.0.0.8:1", [10], [20], [64])
+    assert ret == 0
+    assert event.synced is True
+    assert worker.engine.sync_calls == 0
+    assert worker.engine.async_calls == [("10.0.0.8:1", [10], [20], [64])]
+    assert worker.xfer_stats.failures == 0
+    assert worker.xfer_stats.records[0][1:] == (64, 1)
+
+
+def test_layerwise_async_status_rejects_pending_zero(mooncake):
+    assert mooncake._layerwise_status_token(["WAITING"]) == "WAITING"
+    assert mooncake._layerwise_status_token(5) == 5
+    assert 0 not in mooncake._LAYERWISE_ASYNC_DONE
+
+
 def test_layerwise_notify_is_noop_when_disabled(mooncake):
     worker = object.__new__(mooncake.MooncakeConnectorWorker)
     worker.layerwise_enabled = False

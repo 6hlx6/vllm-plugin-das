@@ -340,6 +340,80 @@ def _record_kv_ready_event():
         return None
 
 
+# mooncake TransferStatusEnum: INITIAL, WAITING, PENDING, INVALID, CANCELED,
+# COMPLETED, TIMEOUT, FAILED. 同步写返回 0 表示成功，这里不能把 0 当成完成。
+_LAYERWISE_ASYNC_DONE = frozenset({5, "COMPLETED"})
+_LAYERWISE_ASYNC_FAIL = frozenset(
+    {3, 4, 6, 7, "INVALID", "CANCELED", "CANCELLED", "TIMEOUT", "FAILED"}
+)
+_LAYERWISE_ASYNC_PENDING = frozenset({0, 1, 2, "INITIAL", "WAITING", "PENDING"})
+
+
+def _layerwise_status_token(status: Any) -> Any:
+    """把 Mooncake 异步状态收成枚举名或整数。"""
+    if isinstance(status, (list, tuple)):
+        if not status:
+            return None
+        return _layerwise_status_token(status[0])
+    if isinstance(status, dict):
+        return _layerwise_status_token(status.get("status", status.get("state")))
+    nested = getattr(status, "status", None)
+    if nested is not None and nested is not status:
+        return _layerwise_status_token(nested)
+    name = getattr(status, "name", None)
+    if isinstance(name, str):
+        return name.upper()
+    if isinstance(status, str):
+        return status.upper()
+    return status
+
+
+def _wait_layerwise_async_batch(engine: Any, batch_id: int, timeout_s: float) -> int:
+    """轮询异步传输。只阻塞发送线程，不调用设备级同步。"""
+    if isinstance(batch_id, int) and batch_id < 0:
+        return batch_id
+    getter = getattr(engine, "get_batch_transfer_status", None)
+    if getter is None:
+        getter = getattr(engine, "get_transfer_status", None)
+    if getter is None:
+        logger.error("Mooncake layerwise async write has no status query")
+        return -1
+    deadline = time.perf_counter() + max(timeout_s, 1.0)
+    unknown_logged = False
+    while True:
+        try:
+            raw = getter([batch_id])
+        except TypeError:
+            raw = getter(batch_id)
+        token = _layerwise_status_token(raw)
+        if token in _LAYERWISE_ASYNC_DONE:
+            return 0
+        if token in _LAYERWISE_ASYNC_FAIL or (
+            isinstance(token, int) and token < 0
+        ):
+            logger.warning(
+                "Mooncake layerwise async batch %s failed status=%s",
+                batch_id,
+                token,
+            )
+            return -1
+        if (
+            not unknown_logged
+            and token not in _LAYERWISE_ASYNC_PENDING
+            and token is not None
+        ):
+            unknown_logged = True
+            logger.warning(
+                "Mooncake layerwise async batch %s unknown status=%r",
+                batch_id,
+                token,
+            )
+        if time.perf_counter() >= deadline:
+            logger.warning("Mooncake layerwise async batch %s timed out", batch_id)
+            return -1
+        time.sleep(0.001)
+
+
 def _is_hcu_global_first_rank() -> bool:
     """Internal LB launches bootstrap only on the global first rank."""
     try:
@@ -2604,7 +2678,11 @@ class MooncakeConnectorWorker:
         dst_ptrs: list[int],
         lengths: list[int],
     ) -> int:
-        """Wait for the compute event, then batch_transfer_sync_write."""
+        """在发送线程上等齐这一层 KV，再异步提交。
+
+        event.synchronize() 只堵住本线程。同步写 batch_transfer_sync_write
+        会做设备级同步，按层调用会把后面的计算停住，所以分层路径不用它。
+        """
         if event is not None:
             try:
                 event.synchronize()
@@ -2612,7 +2690,42 @@ class MooncakeConnectorWorker:
                 logger.exception("Mooncake layerwise event synchronize failed")
         if not src_ptrs:
             return 0
-        return self._send_blocks(remote_session, src_ptrs, dst_ptrs, lengths)
+        submit = getattr(self.engine, "batch_transfer_async_write", None)
+        if submit is None:
+            if not getattr(self, "_layerwise_async_missing_logged", False):
+                self._layerwise_async_missing_logged = True
+                logger.warning(
+                    "Mooncake layerwise async write is unavailable; "
+                    "falling back to batch_transfer_sync_write"
+                )
+            return self._send_blocks(remote_session, src_ptrs, dst_ptrs, lengths)
+        start_time = time.perf_counter()
+        try:
+            batch_id = submit(remote_session, src_ptrs, dst_ptrs, lengths)
+        except Exception:
+            logger.exception("Mooncake layerwise async submit failed")
+            return -1
+        ret_value = _wait_layerwise_async_batch(
+            self.engine,
+            batch_id,
+            float(envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT),
+        )
+        duration = time.perf_counter() - start_time
+        if ret_value == 0:
+            self.xfer_stats.record_transfer(
+                duration_s=duration,
+                total_bytes=sum(lengths),
+                num_descs=len(src_ptrs),
+            )
+            logger.debug(
+                "Layerwise async send to %s done, took %s batch=%s",
+                remote_session,
+                duration,
+                batch_id,
+            )
+        else:
+            self.xfer_stats.record_failed_transfer()
+        return ret_value
 
     async def _send_kv_layerwise(
         self,
