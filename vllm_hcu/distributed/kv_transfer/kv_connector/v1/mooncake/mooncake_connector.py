@@ -186,56 +186,6 @@ def _layerwise_flag_enabled(value: Any) -> bool:
     return str(value).lower() in ("1", "true", "yes", "on")
 
 
-def _layerwise_notify_url(params: dict[str, Any] | None) -> str:
-    """代理提前拉起 Decode 的通知地址。没有则仍走原来的握手时机。"""
-    if not params:
-        return ""
-    return str(params.get("layerwise_notify_url") or "")
-
-
-def _post_layerwise_notify(url: str, payload: dict[str, Any]) -> None:
-    """后台通知代理。失败只记日志，发送仍可在原来的握手到达后继续。"""
-    try:
-        httpx.post(url, json=payload, timeout=2.0)
-        logger.info(
-            "Mooncake layerwise notify transfer_id=%s engine=%s port=%s",
-            payload.get("transfer_id"),
-            payload.get("remote_engine_id"),
-            payload.get("remote_bootstrap_port"),
-        )
-    except Exception:
-        logger.exception(
-            "Mooncake layerwise notify failed transfer_id=%s url=%s",
-            payload.get("transfer_id"),
-            url,
-        )
-
-
-def _apply_alloc_to_layerwise_sessions(
-    sessions: dict[Any, dict],
-    alloc_blocks: dict[str, tuple[int, list[list[int]], str]],
-) -> bool:
-    """握手早于 alloc 时，把 block id 补进已有 session，便于后续层在计算过程中发出。"""
-    updated = False
-    for session in sessions.values():
-        if session.get("block_ids"):
-            continue
-        send_meta = session.get("send_meta")
-        transfer_id = getattr(send_meta, "transfer_id", None)
-        alloc = alloc_blocks.get(str(transfer_id)) if transfer_id else None
-        if not alloc:
-            continue
-        epoch, block_ids, p_req_id = alloc
-        if not block_ids:
-            continue
-        session["epoch"] = epoch
-        session["block_ids"] = block_ids
-        if p_req_id:
-            session["p_req_id"] = p_req_id
-        updated = True
-    return updated
-
-
 def _extra_config_dict(kv_transfer_config: Any) -> dict[str, Any]:
     extra = getattr(kv_transfer_config, "kv_connector_extra_config", None) or {}
     if isinstance(extra, dict):
@@ -338,11 +288,6 @@ def _record_kv_ready_event():
     except Exception:
         logger.debug("Mooncake layerwise event record failed", exc_info=True)
         return None
-
-
-# 每攒够这么多层再做一次同步写。按层各写一次会反复停 GPU；
-# Mooncake 的 batch_transfer_async_write 并发完成回调会 segfault，不能用。
-_LAYERWISE_SEND_GROUP = 8
 
 
 def _is_hcu_global_first_rank() -> bool:
@@ -872,8 +817,6 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
         self.reqs_not_processed: set[TransferId] = set()
         # Alloc-time block ids for layerwise. Not reqs_to_send, so p_ready stays late.
         self.layerwise_alloc: dict[ReqId, tuple[TransferId, list[list[int]]]] = {}
-        # transfer_id -> 代理通知地址。Decode 据此在 Prefill 尚未结束时发起握手。
-        self.layerwise_notify: dict[str, str] = {}
 
     def add_new_req(
         self,
@@ -1307,9 +1250,6 @@ class MooncakeConnectorScheduler:
                 transfer_id = params.get("transfer_id")
                 if transfer_id and block_ids:
                     meta.layerwise_alloc[req_id] = (str(transfer_id), block_ids)
-                    notify_url = _layerwise_notify_url(params)
-                    if notify_url:
-                        meta.layerwise_notify[str(transfer_id)] = notify_url
             self._layerwise_alloc.clear()
 
         return meta
@@ -1537,8 +1477,6 @@ class MooncakeConnectorWorker:
         self._layerwise_alloc_blocks: dict[str, tuple[int, list[list[int]], str]] = {}
         self._layerwise_final_blocks: dict[str, list[list[int]]] = {}
         self._layerwise_sessions: dict[tuple, Any] = {}
-        # 已经通知过代理的 transfer_id，避免每个 forward 重复打。
-        self._layerwise_notified: set[str] = set()
         if self.layerwise_enabled:
             logger.info(
                 "Mooncake layerwise KV enabled on producer: send each layer "
@@ -2386,42 +2324,9 @@ class MooncakeConnectorWorker:
             self._layerwise_computed = [
                 item for item in self._layerwise_computed if item[0] >= current - 2
             ]
-            # 握手可能先到。此时 session 还没有 block，补上后才能在本轮 forward 里按层发。
-            _apply_alloc_to_layerwise_sessions(
-                self._layerwise_sessions, self._layerwise_alloc_blocks
-            )
         sender_loop = getattr(self, "sender_loop", None)
         if sender_loop is not None and alloc:
             asyncio.run_coroutine_threadsafe(self._layerwise_flush(), sender_loop)
-        self._notify_layerwise_proxy(getattr(metadata, "layerwise_notify", None) or {})
-
-    def _notify_layerwise_proxy(self, notifies: dict[str, str]) -> None:
-        """KV 刚分配就通知代理去连 Decode，不等 Prefill 的 HTTP 响应。"""
-        if not notifies or not self.layerwise_enabled:
-            return
-        if int(getattr(self, "tp_rank", 0) or 0) != 0:
-            return
-        if int(getattr(self, "pp_rank", 0) or 0) != 0:
-            return
-        _, bootstrap_port = get_mooncake_bootstrap_addr(self.vllm_config)
-        for transfer_id, url in notifies.items():
-            if not url or transfer_id in self._layerwise_notified:
-                continue
-            self._layerwise_notified.add(transfer_id)
-            alloc = self._layerwise_alloc_blocks.get(transfer_id)
-            request_id = alloc[2] if alloc else ""
-            payload = {
-                "transfer_id": transfer_id,
-                "request_id": request_id,
-                "remote_engine_id": self.engine_id,
-                "remote_bootstrap_port": int(bootstrap_port),
-            }
-            threading.Thread(
-                target=_post_layerwise_notify,
-                args=(url, payload),
-                daemon=True,
-                name="mooncake-layerwise-notify",
-            ).start()
 
     def _layerwise_session_key(self, transfer_id: str, meta: MooncakeXferMetadata):
         return (
@@ -2508,20 +2413,6 @@ class MooncakeConnectorWorker:
             for region in session["local_regions"]:
                 wanted.add(region.layer_index)
         pending_indices = sorted(wanted - session["sent_layers"])
-        # 未结束时不满一组就留下，避免每一层都做一次同步写。
-        if (
-            pending_indices
-            and not session.get("prefill_done")
-            and len(pending_indices) < _LAYERWISE_SEND_GROUP
-        ):
-            if previous_blocks:
-                send_meta.local_block_ids = previous_blocks
-            return
-        grouped_src: list[int] = []
-        grouped_dst: list[int] = []
-        grouped_len: list[int] = []
-        grouped_layers: list[int] = []
-        latest_event = None
         for layer_index in pending_indices:
             paired_local = []
             paired_remote = []
@@ -2550,14 +2441,6 @@ class MooncakeConnectorWorker:
                 continue
             if not src_ptrs:
                 continue
-            grouped_layers.append(layer_index)
-            grouped_src.extend(src_ptrs)
-            grouped_dst.extend(dst_ptrs)
-            grouped_len.extend(lengths)
-            layer_event = events_by_index.get(layer_index)
-            if layer_event is not None:
-                latest_event = layer_event
-        if grouped_src:
             if not session["send_meta"].ttft_send_start_logged:
                 log_ttft_event(
                     "p_send_kv_start",
@@ -2566,21 +2449,18 @@ class MooncakeConnectorWorker:
                 )
                 session["send_meta"].ttft_send_start_logged = True
             logger.info(
-                "Mooncake layerwise send layers=%s-%s count=%s descs=%s prefill_done=%s",
-                grouped_layers[0],
-                grouped_layers[-1],
-                len(grouped_layers),
-                len(grouped_src),
-                bool(session.get("prefill_done")),
+                "Mooncake layerwise send layer=%s descs=%s",
+                layer_index,
+                len(src_ptrs),
             )
             future = self.sender_loop.run_in_executor(
                 self._sender_executor,
                 self._send_layer_blocks,
-                latest_event,
+                events_by_index.get(layer_index),
                 session["remote_session"],
-                grouped_src,
-                grouped_dst,
-                grouped_len,
+                src_ptrs,
+                dst_ptrs,
+                lengths,
             )
             session["futures"].append(future)
         # Chunked prefill grew the block list: resend the full KV once.
@@ -2633,12 +2513,7 @@ class MooncakeConnectorWorker:
         dst_ptrs: list[int],
         lengths: list[int],
     ) -> int:
-        """在发送线程上等齐本组最后一层的 KV，再做一次同步写。
-
-        event.synchronize() 只堵住本线程。一组只调用一次
-        batch_transfer_sync_write，避免每一层都把 GPU 停住。
-        不用 batch_transfer_async_write：并发完成回调会 segfault。
-        """
+        """Wait for the compute event, then batch_transfer_sync_write."""
         if event is not None:
             try:
                 event.synchronize()
