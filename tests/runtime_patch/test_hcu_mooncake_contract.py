@@ -1320,7 +1320,14 @@ def test_layerwise_send_group_is_one_sync_write(mooncake):
             return 0
 
         def batch_transfer_async_write(self, *_args):
-            raise AssertionError("async write segfaults in this Mooncake build")
+            raise AssertionError(
+                "layerwise send must stay on batch_transfer_sync_write"
+            )
+
+        def get_batch_transfer_status(self, *_args):
+            raise AssertionError(
+                "get_batch_transfer_status blocks until done and returns 0 or -1"
+            )
 
     worker = object.__new__(mooncake.MooncakeConnectorWorker)
     worker.engine = _Engine()

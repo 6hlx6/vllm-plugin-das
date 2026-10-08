@@ -340,8 +340,14 @@ def _record_kv_ready_event():
         return None
 
 
-# 每攒够这么多层再做一次同步写。按层各写一次会反复停 GPU；
-# Mooncake 的 batch_transfer_async_write 并发完成回调会 segfault，不能用。
+# 发送线程等齐本组 KV event 后，每攒够这么多层做一次 batch_transfer_sync_write。
+# 按层各写一次会把后面的 prefill 停住。
+# 不用 batch_transfer_async_write。get_batch_transfer_status 不是状态查询：
+# 它在调用线程里一直等到结束，看到 COMPLETED 就 freeBatchID，然后只返回 0 或 -1。
+# 旧轮询把 5 或 "COMPLETED" 当成完成，并且不把 0 当成完成。真实枚举里
+# COMPLETED 是 4，TIMEOUT 是 5。那样既对不上返回值，多个 batch 一起完成时
+# 还会在 freeBatchID 里段错误。inflight_completions 只推迟 delete，没有改这个
+# Python 接口，不能靠它改回异步写。
 _LAYERWISE_SEND_GROUP = 8
 
 
@@ -2636,8 +2642,9 @@ class MooncakeConnectorWorker:
         """在发送线程上等齐本组最后一层的 KV，再做一次同步写。
 
         event.synchronize() 只堵住本线程。一组只调用一次
-        batch_transfer_sync_write，避免每一层都把 GPU 停住。
-        不用 batch_transfer_async_write：并发完成回调会 segfault。
+        batch_transfer_sync_write，避免每一层都把后面的 prefill 停住。
+        不提交 batch_transfer_async_write，也不轮询 get_batch_transfer_status。
+        后者会阻塞到结束并在 COMPLETED 时 freeBatchID，返回值只有 0 或 -1。
         """
         if event is not None:
             try:
