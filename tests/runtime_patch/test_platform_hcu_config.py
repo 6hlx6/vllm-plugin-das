@@ -1667,6 +1667,10 @@ def test_fused_qwen3_rms_rope_effective_policy_partitions_persistent_cache(
 ) -> None:
     """A 0 -> 1 restart must not load the graph persisted for feature-off."""
 
+    # The master switch also gates Qwen4Exp HC SP; hold it off so only the
+    # Qwen3 fusion policy varies here.
+    monkeypatch.setenv("VLLM_HCU_QWEN4_EXP_HC_SP", "0")
+
     def cache_key(master: str, feature: str) -> str:
         monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", master)
         monkeypatch.setenv("VLLM_HCU_USE_FUSED_RMS_ROPE", feature)
@@ -2287,3 +2291,61 @@ def test_sidecar_changes_upstream_hash_and_crosses_serialization_boundaries() ->
     process.join(timeout=30)
     assert process.exitcode == 0
     assert queue.get(timeout=5) == enabled["hcu"]
+
+
+@pytest.mark.parametrize(
+    ("master", "value", "expected"),
+    [
+        ("1", None, True),
+        ("1", "0", False),
+        ("1", "1", True),
+        ("0", None, False),
+        ("0", "1", False),
+    ],
+)
+def test_qwen4_exp_hc_sp_policy_partitions_persistent_cache(
+    monkeypatch: pytest.MonkeyPatch,
+    master: str,
+    value: str | None,
+    expected: bool,
+) -> None:
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", master)
+
+    def resolve(raw: str | None):
+        if raw is None:
+            monkeypatch.delenv("VLLM_HCU_QWEN4_EXP_HC_SP", raising=False)
+        else:
+            monkeypatch.setenv("VLLM_HCU_QWEN4_EXP_HC_SP", raw)
+        config = _validation_config(HcuFeatureConfig())
+        return config, patch_vllm_config.validate_and_update_hcu_config(config)
+
+    config, feature_config = resolve(value)
+    assert feature_config.qwen4_exp_hc_sp is expected
+    assert get_hcu_config(config) == feature_config
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    off_key = _vllm_hash(resolve("0")[0].additional_config)
+    on_key = _vllm_hash(resolve("1")[0].additional_config)
+    assert off_key != on_key
+
+
+@pytest.mark.parametrize(
+    ("lora", "compiler_sp", "expected"),
+    [(False, False, True), (True, False, False), (False, True, False), (True, True, False)],
+)
+def test_qwen4_exp_hc_sp_falls_back_with_lora_or_compiler_sp(
+    monkeypatch: pytest.MonkeyPatch,
+    lora: bool,
+    compiler_sp: bool,
+    expected: bool,
+) -> None:
+    from types import SimpleNamespace
+
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1")
+    monkeypatch.delenv("VLLM_HCU_QWEN4_EXP_HC_SP", raising=False)
+    config = _validation_config(HcuFeatureConfig())
+    if lora:
+        config.lora_config = SimpleNamespace()
+    config.compilation_config.pass_config = SimpleNamespace(enable_sp=compiler_sp)
+
+    feature_config = patch_vllm_config.validate_and_update_hcu_config(config)
+    assert feature_config.qwen4_exp_hc_sp is expected

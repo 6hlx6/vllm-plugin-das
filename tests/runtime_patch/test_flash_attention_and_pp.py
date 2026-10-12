@@ -224,23 +224,58 @@ def test_hcu_fa_boundary_rejects_interface_without_layout(
 
 
 @pytest.mark.parametrize(
-    "incompatible_version",
+    "compatible_version",
     [
         "2.8.4",
-        "2.8.4+dtk2604.torch2110.2609200000.g111111",
-        "2.8.4+foo",
-        "2.8.4+dtk2605.torch2110.2609010000.g999999",
+        "2.8.4+dtk2604.torch2110.2610091222.g130fd4",
+        "2.8.4.post1+dtk2605.torch2110.2609010000.g999999",
+        "2.8.5+dtk2605.torch2110.2609010000.g999999",
+        "2.8.40",
     ],
 )
-def test_hcu_fa_boundary_rejects_vendor_build_without_known_gather_fix(
+def test_hcu_fa_boundary_accepts_compatible_2_8_release(
+    monkeypatch: pytest.MonkeyPatch,
+    compatible_version: str,
+) -> None:
+    _load_hcu_fa_utils_module(
+        monkeypatch,
+        kv_cache_layout="HND",
+        flash_attn_version=compatible_version,
+    )
+
+
+@pytest.mark.parametrize(
+    "incompatible_version",
+    [
+        "2.8.3+dtk2604.torch2110.2609241509.g624d7b",
+        "2.8.4rc1",
+        "2.8.4.dev1+dtk2604",
+        "2.8.4.post1.dev1",
+        "2.8.5rc1",
+        "2.8.5.dev1",
+        "2.9.0+dtk2604",
+    ],
+)
+def test_hcu_fa_boundary_rejects_incompatible_release(
     monkeypatch: pytest.MonkeyPatch,
     incompatible_version: str,
 ) -> None:
-    with pytest.raises(RuntimeError, match="native long-prefill gather fix"):
+    with pytest.raises(RuntimeError, match="compatible flash_attn release"):
         _load_hcu_fa_utils_module(
             monkeypatch,
             kv_cache_layout="HND",
             flash_attn_version=incompatible_version,
+        )
+
+
+def test_hcu_fa_boundary_rejects_invalid_distribution_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(RuntimeError, match="Invalid flash_attn distribution version"):
+        _load_hcu_fa_utils_module(
+            monkeypatch,
+            kv_cache_layout="HND",
+            flash_attn_version="vendor-build-without-pep440-version",
         )
 
 
