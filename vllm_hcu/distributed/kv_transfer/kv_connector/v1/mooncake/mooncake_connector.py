@@ -340,14 +340,8 @@ def _record_kv_ready_event():
         return None
 
 
-# 发送线程等齐本组 KV event 后，每攒够这么多层做一次 batch_transfer_sync_write。
-# 按层各写一次会把后面的 prefill 停住。
-# 不用 batch_transfer_async_write。get_batch_transfer_status 不是状态查询：
-# 它在调用线程里一直等到结束，看到 COMPLETED 就 freeBatchID，然后只返回 0 或 -1。
-# 旧轮询把 5 或 "COMPLETED" 当成完成，并且不把 0 当成完成。真实枚举里
-# COMPLETED 是 4，TIMEOUT 是 5。那样既对不上返回值，多个 batch 一起完成时
-# 还会在 freeBatchID 里段错误。inflight_completions 只推迟 delete，没有改这个
-# Python 接口，不能靠它改回异步写。
+# Submit grouped layer transfers asynchronously from sender threads.
+# The status API waits for completion and reclaims the batch.
 _LAYERWISE_SEND_GROUP = 8
 
 
@@ -1045,7 +1039,7 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         """Return worker-local transfer stats since the last call.
 
         Note the P/D asymmetry: because Mooncake is P-push (P calls
-        batch_transfer_sync_write), P records successful transfer latency,
+        batch transfer API), P records successful transfer latency,
         bytes, and descriptor counts, while D only records failures
         (recv/ZMQ errors). Aggregated NIXL-style dashboards will find
         successful-transfer metrics on the P worker, not D.
@@ -2639,13 +2633,7 @@ class MooncakeConnectorWorker:
         dst_ptrs: list[int],
         lengths: list[int],
     ) -> int:
-        """在发送线程上等齐本组最后一层的 KV，再做一次同步写。
-
-        event.synchronize() 只堵住本线程。一组只调用一次
-        batch_transfer_sync_write，避免每一层都把后面的 prefill 停住。
-        不提交 batch_transfer_async_write，也不轮询 get_batch_transfer_status。
-        后者会阻塞到结束并在 COMPLETED 时 freeBatchID，返回值只有 0 或 -1。
-        """
+        """Wait for the event, submit one async batch, and wait for completion."""
         if event is not None:
             try:
                 event.synchronize()
@@ -2653,7 +2641,9 @@ class MooncakeConnectorWorker:
                 logger.exception("Mooncake layerwise event synchronize failed")
         if not src_ptrs:
             return 0
-        return self._send_blocks(remote_session, src_ptrs, dst_ptrs, lengths)
+        return self._send_blocks_async(
+            remote_session, src_ptrs, dst_ptrs, lengths
+        )
 
     async def _send_kv_layerwise(
         self,
@@ -2664,7 +2654,7 @@ class MooncakeConnectorWorker:
         local_regions: list[TransferRegion],
         remote_regions: list[TransferRegion],
     ) -> None:
-        """One FINISH after every layer. Per-layer replies would drain pull_tasks_count early."""
+        """Send one FINISH after all layer batches complete."""
         for d_req_id, send_meta in pending_reqs.items():
             self._register_layerwise_session(
                 d_req_id, send_meta, meta, local_regions, remote_regions
@@ -2809,6 +2799,55 @@ class MooncakeConnectorWorker:
             self.xfer_stats.record_failed_transfer()
             logger.warning(
                 "Sending to %s failed (ret=%s) after %s (%d descriptors, %d bytes)",
+                remote_session,
+                ret_value,
+                duration,
+                len(src_ptrs),
+                sum(lengths),
+            )
+        return ret_value
+
+    def _send_blocks_async(
+        self,
+        remote_session: str,
+        src_ptrs: list[int],
+        dst_ptrs: list[int],
+        lengths: list[int],
+    ) -> int:
+        """Submit one async batch and wait for its terminal status."""
+        async_submit = getattr(self.engine, "batch_transfer_async_write", None)
+        status_wait = getattr(self.engine, "get_batch_transfer_status", None)
+        if not callable(async_submit) or not callable(status_wait):
+            logger.warning(
+                "Mooncake async batch API is unavailable; using sync write"
+            )
+            return self._send_blocks(remote_session, src_ptrs, dst_ptrs, lengths)
+
+        start_time = time.perf_counter()
+        try:
+            batch_id = async_submit(
+                remote_session, src_ptrs, dst_ptrs, lengths
+            )
+            ret_value = -1 if not batch_id else status_wait([batch_id])
+        except Exception:
+            logger.exception("Mooncake async batch transfer failed")
+            ret_value = -1
+
+        duration = time.perf_counter() - start_time
+        if ret_value == 0:
+            self.xfer_stats.record_transfer(
+                duration_s=duration,
+                total_bytes=sum(lengths),
+                num_descs=len(src_ptrs),
+            )
+            logger.debug(
+                "Async sending to %s done, took %s", remote_session, duration
+            )
+        else:
+            self.xfer_stats.record_failed_transfer()
+            logger.warning(
+                "Async sending to %s failed (ret=%s) after %s "
+                "(%d descriptors, %d bytes)",
                 remote_session,
                 ret_value,
                 duration,

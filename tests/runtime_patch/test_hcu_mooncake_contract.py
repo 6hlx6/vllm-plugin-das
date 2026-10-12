@@ -1293,7 +1293,7 @@ def test_layerwise_notify_url_comes_from_request_params(mooncake):
     )
 
 
-def test_layerwise_send_group_is_one_sync_write(mooncake):
+def test_layerwise_send_group_uses_async_batch_wait(mooncake):
     class _Event:
         def __init__(self):
             self.synced = False
@@ -1313,21 +1313,19 @@ def test_layerwise_send_group_is_one_sync_write(mooncake):
 
     class _Engine:
         def __init__(self):
-            self.sync_calls = []
+            self.async_calls = []
+            self.status_calls = []
 
         def batch_transfer_sync_write(self, session, src, dst, lengths):
-            self.sync_calls.append((session, list(src), list(dst), list(lengths)))
+            raise AssertionError("layerwise send must use async batch submit")
+
+        def batch_transfer_async_write(self, session, src, dst, lengths):
+            self.async_calls.append((session, list(src), list(dst), list(lengths)))
+            return 123
+
+        def get_batch_transfer_status(self, batch_ids):
+            self.status_calls.append(list(batch_ids))
             return 0
-
-        def batch_transfer_async_write(self, *_args):
-            raise AssertionError(
-                "layerwise send must stay on batch_transfer_sync_write"
-            )
-
-        def get_batch_transfer_status(self, *_args):
-            raise AssertionError(
-                "get_batch_transfer_status blocks until done and returns 0 or -1"
-            )
 
     worker = object.__new__(mooncake.MooncakeConnectorWorker)
     worker.engine = _Engine()
@@ -1338,9 +1336,39 @@ def test_layerwise_send_group_is_one_sync_write(mooncake):
     )
     assert ret == 0
     assert event.synced is True
-    assert len(worker.engine.sync_calls) == 1
-    assert worker.engine.sync_calls[0][1:] == ([10, 11], [20, 21], [64, 64])
+    assert len(worker.engine.async_calls) == 1
+    assert worker.engine.async_calls[0][1:] == ([10, 11], [20, 21], [64, 64])
+    assert worker.engine.status_calls == [[123]]
     assert mooncake._LAYERWISE_SEND_GROUP == 8
+
+
+def test_layerwise_send_falls_back_to_sync_api(mooncake):
+    class _Event:
+        def synchronize(self):
+            pass
+
+    class _Engine:
+        def __init__(self):
+            self.sync_calls = []
+
+        def batch_transfer_sync_write(self, session, src, dst, lengths):
+            self.sync_calls.append((session, list(src), list(dst), list(lengths)))
+            return 0
+
+    worker = object.__new__(mooncake.MooncakeConnectorWorker)
+    worker.engine = _Engine()
+    worker.xfer_stats = type(
+        "_Stats",
+        (),
+        {
+            "record_transfer": lambda *_args, **_kwargs: None,
+            "record_failed_transfer": lambda *_args, **_kwargs: None,
+        },
+    )()
+    assert worker._send_layer_blocks(
+        _Event(), "10.0.0.8:1", [10], [20], [64]
+    ) == 0
+    assert len(worker.engine.sync_calls) == 1
 
 
 def test_layerwise_notify_is_noop_when_disabled(mooncake):
