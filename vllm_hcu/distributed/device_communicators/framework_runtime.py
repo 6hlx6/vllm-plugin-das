@@ -36,7 +36,7 @@ def make_deep_ep_ht_kwargs(manager: object, envs: object) -> dict[str, Any]:
 
     return {
         "group": manager.cpu_group,
-        "num_nvl_bytes": _HT_NVL_BUFFER_BYTES,
+        "num_nvl_bytes": envs.VLLM_DEEPEP_BUFFER_SIZE_MB * 1024 * 1024,
         "num_rdma_bytes": num_rdma_bytes,
         "low_latency_mode": False,
         "num_qps_per_rank": num_qps_per_rank,
@@ -56,6 +56,7 @@ def validated_low_latency_rdma_size_hint(
     token_hidden_size: int,
     num_ep_ranks: int,
     num_global_experts: int,
+    num_topk: int = 8,
 ) -> int:
     """Return a model-specific DeepEP hint after detecting integer wraparound."""
 
@@ -87,6 +88,7 @@ def validated_low_latency_rdma_size_hint(
                 hidden=token_hidden_size,
                 num_ranks=num_ep_ranks,
                 num_experts=num_global_experts,
+                num_topk=num_topk,
             )
         except Exception as exc:
             raise ValueError(
@@ -127,6 +129,7 @@ def _manager_low_latency_rdma_size_hint(
         token_hidden_size,
         num_ep_ranks,
         num_global_experts,
+        getattr(manager, "_vllm_hcu_ll_num_topk", 8),
     )
     cache = getattr(manager, "_vllm_hcu_ll_rdma_hint_cache", None)
     if cache is None:

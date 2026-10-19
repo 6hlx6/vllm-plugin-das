@@ -25,6 +25,7 @@ from typing import Literal
 
 from vllm_hcu.compatibility import ensure_vllm_compatible
 from vllm_hcu.patch.config import (
+    bind_hcu_eplb_config,
     HcuFeatureConfig,
     get_hcu_config,
 )
@@ -220,9 +221,12 @@ _CORE_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_load_weights")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_dspark_target")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_rocm_dspark_metadata")),
+    _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_rocm_flashmla_sparse")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_rocm_wo_a_layout")),
     _CallbackSpec(_adapter("core_fix", "patch_gpt_oss_mlp_block")),
+    _CallbackSpec(_adapter("core_fix", "patch_kimi_k3_model")),
     _CallbackSpec(_adapter("core_fix", "patch_qwen3_5_mamba_state_dtype")),
+    _CallbackSpec(_adapter("core_fix", "patch_qwen3_dflash_nn_layout")),
     _CallbackSpec(_adapter("core_fix", "patch_qwen3_vl")),
     _CallbackSpec(_adapter("core_fix", "patch_qwen3_vl_moe")),
 )
@@ -308,6 +312,12 @@ _CUDA_VALIDATION_ID = (
 # proposer/eagle/ubatch -> DeepEP all2all.  The PyNccl pair is optional unless
 # an explicit ``all2all_backend='pynccl'`` config requests it.
 _FRAMEWORK_CALLBACKS: tuple[_CallbackSpec, ...] = (
+    _CallbackSpec(_adapter("framework_opt", "patch_model_loader_static_eplb")),
+    _CallbackSpec(_adapter("framework_opt", "patch_model_loader_static_eplb_gate")),
+    _CallbackSpec(_adapter("framework_opt", "patch_static_expert_mapping")),
+    _CallbackSpec(_adapter("framework_opt", "patch_offline_eplb")),
+    _CallbackSpec(_adapter("framework_opt", "patch_eplb_communicator")),
+    _CallbackSpec(_adapter("framework_opt", "patch_routing_simulator")),
     _CallbackSpec(
         _adapter("framework_opt", "patch_gpu_worker_shutdown"),
     ),
@@ -317,8 +327,17 @@ _FRAMEWORK_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(
         _adapter("framework_opt", "patch_pcp_model_state"),
     ),
+    # v0.25.1 has no SlotMappingMode, so MultiGroupBlockTable launches the
+    # slot-mapping kernel once per KV cache group even for Mamba/GDN groups.
+    _CallbackSpec(
+        _adapter("framework_opt", "patch_slot_mapping_modes"),
+    ),
     _CallbackSpec(
         _adapter("framework_opt", "patch_dp_utils"),
+        feature="deepep_low_latency",
+    ),
+    _CallbackSpec(
+        _adapter("framework_opt", "patch_gpu_dp_utils"),
         feature="deepep_low_latency",
     ),
     _CallbackSpec(
@@ -347,8 +366,15 @@ _FRAMEWORK_CALLBACKS: tuple[_CallbackSpec, ...] = (
         _adapter("framework_opt", "patch_eagle_utils"),
         feature="multi_layers_mtp",
     ),
+    _CallbackSpec(
+        _adapter("framework_opt", "patch_draft_speculator_inputs"),
+    ),
     _CallbackSpec(_adapter("framework_opt", "patch_gpu_ubatch_wrapper")),
     _CallbackSpec(_adapter("framework_opt", "patch_ubatch_utils")),
+    _CallbackSpec(
+        _adapter("framework_opt", "patch_base_communicator_pcp"),
+        feature="deepep",
+    ),
     _CallbackSpec(
         _adapter("framework_opt", "patch_all2all"), feature="deepep"
     ),
@@ -390,6 +416,13 @@ _REQUIRED_TERMINAL_IDS = frozenset(
         "worker.framework_opt.spec_decode.eagle_topk_buffer",
         "worker.framework_opt.communicator.deep_ep_runtime",
     }
+)
+
+# DeepEP's all-to-all module is loaded lazily by distributed runtime setup.
+# It may therefore still be armed after model construction, but must be live
+# once compile/warmup has completed.
+_MODEL_LOAD_DEFERRED_TERMINAL_IDS = frozenset(
+    {"worker.framework_opt.communicator.deep_ep_runtime"}
 )
 
 
@@ -767,6 +800,7 @@ def apply_worker_patches(vllm_config: object | None = None) -> None:
         set_process_role("Worker")
         # This is both normalization and the spawn/unpickle boundary check.
         config = get_hcu_config(vllm_config)
+        bind_hcu_eplb_config(vllm_config)
         if HcuFeatureConfig.from_mapping(config.to_dict()) != config:
             raise RuntimeError("HCU feature sidecar failed its worker round-trip check")
         if vllm_config is not None:
@@ -793,12 +827,21 @@ def apply_worker_patches(vllm_config: object | None = None) -> None:
         states = _feature_states(vllm_config, config)
         for patch_id, feature in _patch_features().items():
             IMPORT_COORDINATOR.set_feature_enabled(patch_id, states[feature])
+        from vllm_hcu.patch.worker.framework_opt import patch_gpu_dp_utils
+
+        patch_gpu_dp_utils.bind_skip_cross_dp_cg_sync(
+            enabled=(
+                _parallel_backend(vllm_config) == "deepep_low_latency"
+                and not config.deepep_auto
+            )
+        )
         _raise_latched_or_required_failures(IMPORT_COORDINATOR)
 
 
 def validate_worker_patches(
     require_applied: bool = True,
     *,
+    phase: Literal["model_load", "runtime"] = "runtime",
     coordinator: ExactImportCoordinator | None = None,
 ) -> None:
     """Validate enabled feature chains at a caller-defined terminal point.
@@ -814,15 +857,24 @@ def validate_worker_patches(
 
     if not isinstance(require_applied, bool):
         raise TypeError("require_applied must be bool")
+    if phase not in {"model_load", "runtime"}:
+        raise ValueError(f"unknown worker patch validation phase: {phase!r}")
     coordinator = IMPORT_COORDINATOR if coordinator is None else coordinator
     _raise_latched_or_required_failures(coordinator)
     if not require_applied:
         return
 
+    deferred = (
+        _MODEL_LOAD_DEFERRED_TERMINAL_IDS
+        if phase == "model_load"
+        else frozenset()
+    )
+
     pending: list[str] = []
     for registration in coordinator.registrations():
         if (
             registration.patch_id in _REQUIRED_TERMINAL_IDS
+            and registration.patch_id not in deferred
             and registration.feature_enabled
             and registration.status != PatchStatus.APPLIED.value
         ):

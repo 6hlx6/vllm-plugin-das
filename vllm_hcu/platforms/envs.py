@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    VLLM_USE_NN : bool = False
+    VLLM_USE_NN : bool = True
     VLLM_HCU_USE_FLASH_ATTN: bool = False
     VLLM_HCU_USE_FLASH_ATTN_UNIFIED: bool = False
     VLLM_HCU_USE_FLASH_ATTN_VARLEN: bool = True
@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_SKIP_WEIGHT_DEBUG : bool = False
     VLLM_HCU_USE_CUSTOM_TOPK_TOPP_SAMPLER : bool = False
     VLLM_HCU_USE_CUSTOM_RMS_NORM : bool = False
+    VLLM_HCU_USE_CUSTOM_ALLREDUCE : bool = True
     VLLM_HCU_USE_CUSTOM_AITER_FLA : bool = False
     VLLM_HCU_USE_AITER_FUSED_SIGMOID_GATING_DELTA_RULE_UPDATE: bool = True
     VLLM_HCU_USE_AITER_CHUNK_GATED_DELTA_RULE_HIP: bool = True
@@ -41,9 +42,16 @@ if TYPE_CHECKING:
     VLLM_HCU_LIGHTLY_CP_THRESHOLD: int = 2048
     VLLM_HCU_USE_LIGHTOP_TOPK: bool = False
     VLLM_HCU_USE_LIGHTOP_SPARSE_MLA_TOPK: bool = True
+    VLLM_HCU_USE_LIGHTOP_FAST_TOPK_TRANSFORM: bool = True
+    VLLM_HCU_USE_AITER_OPUS_PAGED_MQA_LOGITS: bool = True
+    VLLM_DCP_Q_REPLICATE: bool = False
     VLLM_HCU_USE_AITER_MHC: bool = True
     VLLM_HCU_USE_TILELANG_MHC_PRENORM: bool = True
     VLLM_HCU_DEEPSEEK_V4_ROCM_DECODE_FALLBACK: bool = False
+    VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE: bool = True
+    VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL: bool = True
+    VLLM_HCU_HYV4_FP8_KV_DEQUANT: bool = False
+    VLLM_HCU_ENABLE_HYV4_GATE_A2A_OVERLAP: bool = False
     VLLM_HCU_DEEPSEEK_V4_ROCM_FAST_WOA: bool = True
     VLLM_HCU_ENABLE_DEEPSEEK_V4_MULTI_STREAM: bool = True
     VLLM_HCU_DEEPSEEK_V4_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 16384
@@ -63,6 +71,8 @@ if TYPE_CHECKING:
     VLLM_HCU_FLASH_ATTN_BLOCK_ALIGNMENT_SIZE: Optional[int] = None
     VLLM_HCU_MAMBA_SSM_CACHE_DTYPE: bool = False
     VLLM_HCU_USE_PD_SPLIT: bool = False
+    VLLM_HCU_STEADY_DECODE_SCHED_FASTPATH: bool = False
+    VLLM_HCU_1D_MROPE: bool = False
     VLLM_HCU_USE_AITER_W4A16_MOE: bool = False
     VLLM_HCU_USE_TORCH_EPLB_MAP_RECORD: bool = False
     VLLM_HCU_USE_AITER_MOE_SHUFFLE: bool = True
@@ -162,9 +172,9 @@ def resolve_hcu_flash_attn_mode(explicit_mode: Optional[str]) -> str:
 hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # path to the logs of redirect-output, abstrac of related are ok
 
-    # If set, vLLM will transpose weight to use nn layout
+    # If set, vLLM will transpose weight to use nn layout.
     "VLLM_USE_NN":
-    lambda: (os.environ.get("VLLM_USE_NN", "True").lower() in 
+    lambda: (os.environ.get("VLLM_USE_NN", "True").lower() in
              ("true", "1")),
     # vLLM will use FlashAttention Backend on hcu, office attention layerout blocksize 128
     "VLLM_HCU_USE_FLASH_ATTN":
@@ -227,6 +237,10 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
             ("true", "1")),
     "VLLM_HCU_USE_CUSTOM_RMS_NORM":
     lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_RMS_NORM", "True").lower() in
+             ("true", "1")),
+    # Enable HCU P2P custom all-reduce by default; set False to use RCCL/NCCL.
+    "VLLM_HCU_USE_CUSTOM_ALLREDUCE":
+    lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_ALLREDUCE", "True").lower() in
              ("true", "1")),
     "VLLM_HCU_USE_CUSTOM_AITER_FLA":
     lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_AITER_FLA", "True").lower() in
@@ -298,6 +312,23 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
         lambda: (os.environ.get("VLLM_HCU_USE_LIGHTOP_SPARSE_MLA_TOPK", "True").lower() in
                     ("true", "1")),
 
+    # Use fused TopK + page-table transform for sparse MLA decode by default.
+    "VLLM_HCU_USE_LIGHTOP_FAST_TOPK_TRANSFORM":
+        lambda: (os.environ.get(
+            "VLLM_HCU_USE_LIGHTOP_FAST_TOPK_TRANSFORM", "True"
+        ).lower() in ("true", "1")),
+
+    # Use AITER Opus paged-MQA for HCU DSA decode by default.
+    "VLLM_HCU_USE_AITER_OPUS_PAGED_MQA_LOGITS":
+        lambda: (os.environ.get(
+            "VLLM_HCU_USE_AITER_OPUS_PAGED_MQA_LOGITS", "True"
+        ).lower() in ("true", "1")),
+
+    # Match upstream vLLM's opt-in for MLA decode query replication.
+    "VLLM_DCP_Q_REPLICATE":
+        lambda: (os.environ.get("VLLM_DCP_Q_REPLICATE", "False").lower() in
+                    ("true", "1")),
+
     # If use AITER MHC impl, please set True
     "VLLM_HCU_USE_AITER_MHC":
         lambda: (os.environ.get("VLLM_HCU_USE_AITER_MHC", "True").lower() in
@@ -312,6 +343,30 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HCU_DEEPSEEK_V4_ROCM_DECODE_FALLBACK":
         lambda: (os.environ.get("VLLM_HCU_DEEPSEEK_V4_ROCM_DECODE_FALLBACK", "False").lower() in
                     ("true", "1")),
+
+    # Use FlashMLA sparse decode in the native ROCm DeepSeek-V4 model.
+    "VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE":
+        lambda: (os.environ.get("VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE", "True").lower() in
+                    ("true", "1")),
+
+    # Use FlashMLA sparse prefill in the native ROCm DeepSeek-V4 model.
+    "VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL":
+        lambda: (os.environ.get("VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL", "True").lower() in
+                    ("true", "1")),
+
+    # Whether to dequantize the HY V4 fp8 KV cache to BF16 before the sparse
+    # attention, instead of calling the fp8 FlashMLA kernel. The fp8 kernel
+    # hardcodes DeepSeek's fp8_ds_mla geometry (pe_dim == 64). In HY V4's
+    # mixed-batch mode this covers both the prefill and decode paths.
+    "VLLM_HCU_HYV4_FP8_KV_DEQUANT":
+        lambda: (os.environ.get("VLLM_HCU_HYV4_FP8_KV_DEQUANT", "False").lower() in
+                    ("true", "1")),
+
+    # Overlap HY V4 gated-MLA g_proj with DCP A2A only.
+    "VLLM_HCU_ENABLE_HYV4_GATE_A2A_OVERLAP":
+        lambda: (os.environ.get(
+            "VLLM_HCU_ENABLE_HYV4_GATE_A2A_OVERLAP", "False"
+        ).lower() in ("true", "1")),
 
     # Whether to use the local inverse-RoPE + BF16 einsum path for DeepSeek V4 ROCm WO_A.
     "VLLM_HCU_DEEPSEEK_V4_ROCM_FAST_WOA":
@@ -409,6 +464,13 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HCU_USE_PD_SPLIT":
         lambda: (os.environ.get("VLLM_HCU_USE_PD_SPLIT", "False").lower() in
                  ("true", "1")),
+
+    # Guarded steady decode scheduling; opt-in on a supported async scheduler.
+    "VLLM_HCU_STEADY_DECODE_SCHED_FASTPATH":
+        lambda: _environment_flag(os.environ.get("VLLM_HCU_STEADY_DECODE_SCHED_FASTPATH", "0")),
+    # Opt-in token-major M-RoPE storage; also gated by USE_CUSTOM_OPS.
+    "VLLM_HCU_1D_MROPE":
+        lambda: _environment_flag(os.environ.get("VLLM_HCU_1D_MROPE", "0")),
 
     # If use custom AITER_W4A16_MOE impl, please set True
     "VLLM_HCU_USE_AITER_W4A16_MOE":

@@ -26,8 +26,10 @@ from vllm_hcu.patch.worker.framework_opt import (
     patch_base_device_communicator,
     patch_cuda_communicator,
     patch_dp_utils,
+    patch_draft_speculator_inputs,
     patch_eagle_utils,
     patch_forward_context,
+    patch_gpu_dp_utils,
     patch_gpu_ubatch_wrapper,
     patch_llm_base_proposer,
     patch_pynccl,
@@ -306,7 +308,10 @@ def test_deep_ep_adapter_uses_hcu_buffer_sms_contract_and_is_idempotent(
     manager = module.DeepEPHTAll2AllManager("group", "tcp")
     assert manager.num_sms == 30
     kwargs = manager._make_all2all_kwargs()
-    assert kwargs["num_nvl_bytes"] == 1_000_000_000
+    # NVL buffer bytes must honor ``VLLM_DEEPEP_BUFFER_SIZE_MB`` so users can
+    # trade off DeepEP staging memory against KV cache / MoE workspace
+    # without recompiling the plugin.  The fake module sets it to 256 MiB.
+    assert kwargs["num_nvl_bytes"] == 256 * 1024 * 1024
     assert kwargs["num_rdma_bytes"] == 500_000_000
     assert kwargs["num_qps_per_rank"] == 30
     manager.set_num_sms(29)
@@ -321,6 +326,37 @@ def test_deep_ep_adapter_uses_hcu_buffer_sms_contract_and_is_idempotent(
     assert intranode.num_sms == 60
     assert intranode_kwargs["num_rdma_bytes"] == 0
     assert intranode_kwargs["num_qps_per_rank"] == 1
+    assert intranode_kwargs["num_nvl_bytes"] == 256 * 1024 * 1024
+
+
+def test_deep_ep_ht_nvl_buffer_tracks_deepep_buffer_size_mb_env(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """HT NVL buffer must scale with ``VLLM_DEEPEP_BUFFER_SIZE_MB``.
+
+    Hardcoding the DeepEP staging buffer forces every PCP+EP deployment to
+    surrender ~1 GiB per rank regardless of workload.  Reading the env var
+    (matching upstream's contract) lets operators shrink the staging area
+    when their per-rank token budget is small, freeing that memory for the
+    KV cache and the MoE workspace under DeepEP-HT.
+    """
+    from vllm_hcu.platforms import envs as hcu_envs
+
+    module = _fake_all2all_module()
+    monkeypatch.setattr(hcu_envs, "VLLM_HCU_DEEPEP_NUM_SMS", 17)
+    assert patch_all2all.apply_to_module(module) is True
+
+    # Shrink the staging budget and verify a fresh manager picks it up.
+    module.envs.VLLM_DEEPEP_BUFFER_SIZE_MB = 64
+    small = module.DeepEPHTAll2AllManager("group", "tcp")
+    small_kwargs = small._make_all2all_kwargs()
+    assert small_kwargs["num_nvl_bytes"] == 64 * 1024 * 1024
+
+    # Grow it and verify the same code path scales up rather than clamping.
+    module.envs.VLLM_DEEPEP_BUFFER_SIZE_MB = 2048
+    big = module.DeepEPHTAll2AllManager("group", "tcp")
+    big_kwargs = big._make_all2all_kwargs()
+    assert big_kwargs["num_nvl_bytes"] == 2048 * 1024 * 1024
 
 
 def test_deep_ep_auto_manager_sizes_one_buffer_for_ht_and_ll(
@@ -355,12 +391,14 @@ def test_deep_ep_auto_manager_sizes_one_buffer_for_ht_and_ll(
         "hidden": 7168,
         "num_ranks": 8,
         "num_experts": 256,
+        "num_topk": 8,
     }
     assert calls[-1] == {
         "num_max_dispatch_tokens_per_rank": 32,
         "hidden": 7168,
         "num_ranks": 8,
         "num_experts": 256,
+        "num_topk": 8,
     }
     assert kwargs == {
         "group": "group",
@@ -381,6 +419,28 @@ def test_deep_ep_auto_manager_sizes_one_buffer_for_ht_and_ll(
         num_local_experts=32,
     ) == kwargs
     assert len(calls) == 32
+
+
+def test_deep_ep_low_latency_hint_tracks_model_topk(monkeypatch):
+    calls = []
+
+    class Buffer:
+        @staticmethod
+        def get_low_latency_rdma_size_hint(**kwargs):
+            calls.append(kwargs)
+            return kwargs['num_max_dispatch_tokens_per_rank'] * kwargs['num_topk']
+
+    monkeypatch.setitem(sys.modules, 'deep_ep', SimpleNamespace(Buffer=Buffer))
+    module = _fake_all2all_module()
+    patch_all2all.apply_to_module(module)
+    manager = module.DeepEPLLAll2AllManager('group', 'tcp')
+    manager._vllm_hcu_ll_num_topk = 16
+    kwargs = manager._make_all2all_kwargs(4, 3584, 8, 896, 112)
+    assert kwargs['num_rdma_bytes'] == 64
+    assert all(call['num_topk'] == 16 for call in calls)
+    manager._vllm_hcu_ll_num_topk = 8
+    assert manager._make_all2all_kwargs(4, 3584, 8, 896, 112)['num_rdma_bytes'] == 32
+    assert len(calls) == 8
 
 
 def test_deep_ep_low_latency_rejects_first_invalid_model_specific_hint(
@@ -446,6 +506,7 @@ def test_deep_ep_low_latency_rejects_first_invalid_model_specific_hint(
         "hidden": 256,
         "num_ranks": 2,
         "num_experts": 16,
+        "num_topk": 8,
     }
     assert manager._make_all2all_kwargs(
         max_num_tokens_per_dp_rank=512,
@@ -1186,6 +1247,209 @@ def test_dp_coordination_deepep_low_latency_and_feature_off_delegation():
     assert calls == [(4, normal)]
 
 
+def test_gpu_dp_cg_padding_sync_skip_for_deepep_low_latency():
+    calls: list[object] = []
+
+    def sync_cudagraph_and_dp_padding(
+        cudagraph_manager,
+        desired_batch_desc,
+        num_tokens,
+        num_reqs,
+        uniform_token_count,
+        dp_size,
+        dp_rank,
+        num_active_loras=0,
+    ):
+        calls.append(desired_batch_desc)
+        return "synced", "tokens"
+
+    module = _module(
+        patch_gpu_dp_utils.TARGET_MODULE,
+        sync_cudagraph_and_dp_padding=sync_cudagraph_and_dp_padding,
+    )
+    patch_gpu_dp_utils.bind_skip_cross_dp_cg_sync(enabled=True)
+    try:
+        assert patch_gpu_dp_utils.apply_to_module(module) is True
+        assert patch_gpu_dp_utils.apply_to_module(module) is False
+        assert module.sync_cudagraph_and_dp_padding(
+            None, "local_desc", 4, 2, None, 32, 0
+        ) == ("local_desc", None)
+        assert calls == []
+        patch_gpu_dp_utils.bind_skip_cross_dp_cg_sync(enabled=False)
+        assert module.sync_cudagraph_and_dp_padding(
+            None, "local_desc", 4, 2, None, 32, 0
+        ) == ("synced", "tokens")
+        assert calls == ["local_desc"]
+    finally:
+        patch_gpu_dp_utils.bind_skip_cross_dp_cg_sync(enabled=False)
+
+
+def test_draft_speculator_eager_temperature_seeds_zero_copy():
+    class _IdxMapping:
+        def __getitem__(self, key):
+            return self
+
+        def copy_(self, other):
+            self.copied = other
+
+        def fill_(self, value):
+            self.filled = value
+
+    class DraftModelSpeculator:
+        def __init__(self):
+            self.vllm_config = SimpleNamespace(
+                compilation_config=SimpleNamespace(cudagraph_mode=False)
+            )
+            self.temperature = SimpleNamespace(name="buf_t")
+            self.seeds = SimpleNamespace(name="buf_s")
+            self.idx_mapping = _IdxMapping()
+            self.draft_logits = None
+
+        def _copy_request_inputs(self, num_reqs, idx_mapping, temperature, seeds):
+            raise AssertionError("original should be wrapped")
+
+    module = _module(patch_draft_speculator_inputs.TARGET_MODULE)
+    module.DraftModelSpeculator = DraftModelSpeculator
+    assert patch_draft_speculator_inputs.apply_to_module(module) is True
+    assert patch_draft_speculator_inputs.apply_to_module(module) is False
+    obj = DraftModelSpeculator()
+    temperature = SimpleNamespace(name="caller_t")
+    seeds = SimpleNamespace(name="caller_s")
+    idx = object()
+    obj._copy_request_inputs(2, idx, temperature, seeds)
+    assert obj.temperature is temperature
+    assert obj.seeds is seeds
+    assert obj.idx_mapping.copied is idx
+
+
+def test_draft_speculator_full_graph_keeps_fixed_inputs_across_uva_rotation():
+    class _FixedGraphInput:
+        def __init__(self):
+            self.value = None
+
+        def copy_(self, other):
+            self.value = other.value
+
+    class _IdxMapping:
+        def __getitem__(self, key):
+            return self
+
+        def copy_(self, other):
+            self.copied = other
+
+        def fill_(self, value):
+            self.filled = value
+
+    class DraftModelSpeculator:
+        def __init__(self):
+            self.vllm_config = SimpleNamespace(
+                compilation_config=SimpleNamespace(cudagraph_mode=True)
+            )
+            self.temperature = _FixedGraphInput()
+            self.seeds = _FixedGraphInput()
+            self.idx_mapping = _IdxMapping()
+            self.draft_logits = None
+
+        def _copy_request_inputs(self, num_reqs, idx_mapping, temperature, seeds):
+            self.temperature.copy_(temperature)
+            self.seeds.copy_(seeds)
+            self.idx_mapping[:num_reqs].copy_(idx_mapping)
+
+    module = _module(patch_draft_speculator_inputs.TARGET_MODULE)
+    module.DraftModelSpeculator = DraftModelSpeculator
+    assert patch_draft_speculator_inputs.apply_to_module(module) is True
+
+    obj = DraftModelSpeculator()
+    fixed_temperature = obj.temperature
+    fixed_seeds = obj.seeds
+
+    # First staged write selects UVA views A. A full graph captures the
+    # addresses held by the speculator after this copy.
+    obj._copy_request_inputs(
+        1,
+        object(),
+        SimpleNamespace(value=0.25),
+        SimpleNamespace(value=101),
+    )
+    captured_temperature = obj.temperature
+    captured_seeds = obj.seeds
+
+    # The next staged write rotates the caller to UVA views B. Replaying the
+    # graph must still read its stable inputs, now updated with B's values.
+    obj._copy_request_inputs(
+        1,
+        object(),
+        SimpleNamespace(value=0.75),
+        SimpleNamespace(value=202),
+    )
+
+    assert obj.temperature is fixed_temperature is captured_temperature
+    assert obj.seeds is fixed_seeds is captured_seeds
+    assert captured_temperature.value == 0.75
+    assert captured_seeds.value == 202
+
+
+@pytest.mark.hcu
+def test_draft_speculator_full_graph_replay_reads_rotated_sampling_inputs():
+    if not torch.cuda.is_available():
+        pytest.skip("requires an HCU device")
+
+    class DraftModelSpeculator:
+        def __init__(self):
+            self.vllm_config = SimpleNamespace(
+                compilation_config=SimpleNamespace(cudagraph_mode=True)
+            )
+            self.temperature = torch.zeros(1, dtype=torch.float32, device="cuda")
+            self.seeds = torch.zeros(1, dtype=torch.int64, device="cuda")
+            self.idx_mapping = torch.zeros(1, dtype=torch.int32, device="cuda")
+            self.draft_logits = None
+            self.original_calls = 0
+
+        def _copy_request_inputs(self, num_reqs, idx_mapping, temperature, seeds):
+            self.original_calls += 1
+            self.temperature[:num_reqs].copy_(temperature)
+            self.seeds[:num_reqs].copy_(seeds)
+            self.idx_mapping[:num_reqs].copy_(idx_mapping)
+
+    module = _module(patch_draft_speculator_inputs.TARGET_MODULE)
+    module.DraftModelSpeculator = DraftModelSpeculator
+    assert patch_draft_speculator_inputs.apply_to_module(module) is True
+
+    obj = DraftModelSpeculator()
+    fixed_temperature_ptr = obj.temperature.data_ptr()
+    fixed_seeds_ptr = obj.seeds.data_ptr()
+    idx_mapping = torch.tensor([0], dtype=torch.int32, device="cuda")
+
+    # These distinct allocations model consecutive views selected from the
+    # rotating UVA pool without requiring the UVA extension in contract CI.
+    temperature_a = torch.tensor([0.25], dtype=torch.float32, device="cuda")
+    seeds_a = torch.tensor([101], dtype=torch.int64, device="cuda")
+    temperature_b = torch.tensor([0.75], dtype=torch.float32, device="cuda")
+    seeds_b = torch.tensor([202], dtype=torch.int64, device="cuda")
+    assert temperature_a.data_ptr() != temperature_b.data_ptr()
+    assert seeds_a.data_ptr() != seeds_b.data_ptr()
+
+    obj._copy_request_inputs(1, idx_mapping, temperature_a, seeds_a)
+    torch.cuda.synchronize()
+
+    output_temperature = torch.empty_like(obj.temperature)
+    output_seeds = torch.empty_like(obj.seeds)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output_temperature.copy_(obj.temperature)
+        output_seeds.copy_(obj.seeds)
+
+    obj._copy_request_inputs(1, idx_mapping, temperature_b, seeds_b)
+    assert obj.temperature.data_ptr() == fixed_temperature_ptr
+    assert obj.seeds.data_ptr() == fixed_seeds_ptr
+
+    graph.replay()
+    torch.cuda.synchronize()
+    assert output_temperature.cpu().item() == 0.75
+    assert output_seeds.cpu().item() == 202
+    assert obj.original_calls == 2
+
+
 class _Buffer:
     def __init__(self, size, **kwargs):
         self.size = size
@@ -1234,6 +1498,9 @@ def _fake_proposer_module() -> ModuleType:
 
         def _maybe_share_lm_head(self, target_language_model):
             return "official-share"
+
+        def model_returns_tuple(self):
+            return self.method != "mtp"
 
         def _determine_batch_execution_and_padding(
             self, num_tokens, use_cudagraphs=True
@@ -1291,14 +1558,28 @@ def test_proposer_sidecar_init_cplb_fix_rocm_preservation_and_custom_sp_padding(
     assert prepared.num_kv_actual_tokens == 5
 
 
-def test_proposer_registers_hcu_spec_decode_metadata_once() -> None:
+def test_proposer_registers_hcu_spec_decode_metadata_once(monkeypatch) -> None:
+    import builtins
+
+    original_import = builtins.__import__
+
+    def reject_kernel_import(name, *args, **kwargs):
+        if name == "flash_attn" or name in {
+            "vllm_hcu.v1.attention.backends.flash_attn",
+            "vllm_hcu.v1.attention.backends.fa_utils",
+        }:
+            raise AssertionError("metadata registration imported optional FA kernels")
+        return original_import(name, *args, **kwargs)
+
     from vllm.v1.attention.backends.mla.flashmla_sparse import (
         FlashMLASparseMetadata,
     )
     from vllm_hcu.v1.spec_decode import proposer_runtime
-    from vllm_hcu.v1.attention.backends.flash_attn import (
+    from vllm_hcu.v1.attention.backends.flash_attn_metadata import (
         FlashAttentionMetadata,
     )
+
+    monkeypatch.setattr(builtins, "__import__", reject_kernel_import)
 
     proposer = SimpleNamespace(allowed_attn_types=(str,))
     config = _proposer_config()
@@ -1370,7 +1651,7 @@ def test_proposer_allows_triton_fallback_when_flash_attn_is_missing(
     assert proposer.allowed_attn_types[0] is str
 
 
-def test_proposer_propagates_flash_attention_symbol_errors(
+def test_proposer_propagates_flash_attention_metadata_errors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import builtins
@@ -1380,8 +1661,8 @@ def test_proposer_propagates_flash_attention_symbol_errors(
     original_import = builtins.__import__
 
     def import_with_incompatible_flash_attention(name, *args, **kwargs):
-        if name == "vllm_hcu.v1.attention.backends.flash_attn":
-            raise ImportError("cannot import name 'hg_flash_attn_varlen_func'")
+        if name == "vllm_hcu.v1.attention.backends.flash_attn_metadata":
+            raise ImportError("cannot import name 'FlashAttentionMetadata'")
         return original_import(name, *args, **kwargs)
 
     monkeypatch.setattr(
@@ -1390,7 +1671,7 @@ def test_proposer_propagates_flash_attention_symbol_errors(
         import_with_incompatible_flash_attention,
     )
 
-    with pytest.raises(ImportError, match="hg_flash_attn_varlen_func"):
+    with pytest.raises(ImportError, match="FlashAttentionMetadata"):
         proposer_runtime.initialize_proposer(
             SimpleNamespace(),
             SimpleNamespace(allowed_attn_types=(str,)),
@@ -1400,8 +1681,10 @@ def test_proposer_propagates_flash_attention_symbol_errors(
         )
 
 
+@pytest.mark.parametrize("kimi_tuple", [False, True])
 def test_proposer_lightly_cp_atomic_metadata_and_forward_context_chain(
     monkeypatch: pytest.MonkeyPatch,
+    kimi_tuple,
 ):
     from vllm_hcu.v1.spec_decode import proposer_runtime
 
@@ -1456,11 +1739,17 @@ def test_proposer_lightly_cp_atomic_metadata_and_forward_context_chain(
     class Model:
         def __call__(self, **kwargs):
             events.append(("model", kwargs))
+            if kimi_tuple:
+                return torch.full((1, 2), 3.0), torch.full((1, 2), 7.0)
             return torch.ones(1, 2)
 
     def build_metadata(metadata, draft_index=None):
         events.append(("metadata", metadata))
         return [metadata], {"layer": metadata}
+
+    def sample(hidden):
+        torch.testing.assert_close(hidden, torch.full((1, 2), 3.0 if kimi_tuple else 1.0))
+        return torch.tensor([42])
 
     proposer = SimpleNamespace(
         method="mtp",
@@ -1489,10 +1778,18 @@ def test_proposer_lightly_cp_atomic_metadata_and_forward_context_chain(
         vllm_config=object(),
         _get_slot_mapping=lambda *args: {"slot": args},
         model_returns_tuple=lambda: False,
-        _greedy_sample=lambda hidden: torch.tensor([42]),
+        _greedy_sample=sample,
         num_speculative_tokens=1,
         parallel_drafting=False,
     )
+    if kimi_tuple:
+        patched_module = _fake_proposer_module()
+        patch_llm_base_proposer.apply_to_module(patched_module)
+        proposer.draft_model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["KimiK3MTPModel"]))
+        proposer.model_returns_tuple = (
+            patched_module.SpecDecodeBaseProposer.model_returns_tuple.__get__(proposer)
+        )
     result = proposer_runtime.propose(
         module,
         proposer,
@@ -1547,6 +1844,8 @@ def test_proposer_lightly_cp_atomic_metadata_and_forward_context_chain(
         object(),
     )
     assert result.tolist() == [[42, 42]]
+    if kimi_tuple:
+        torch.testing.assert_close(proposer.hidden_states[:1], torch.full((1, 2), 7.0))
     assert ("canonical", canonical) in events
     assert ("metadata", canonical) in events
 
@@ -1815,6 +2114,139 @@ def test_pp_v2_spec_drafts_are_broadcast_to_non_last_rank(
     ]
 
 
+@pytest.mark.parametrize("is_last", [False, True])
+def test_pp_mtp_rejects_oversized_sample_before_broadcast(is_last):
+    from vllm_hcu.v1.hcu_model_runner_v2 import install_fixed_width_pp_sample_broadcast
+    calls = []
+    handler = SimpleNamespace(is_last_rank=is_last, max_sample_len=4,
+                              broadcast=lambda *args: calls.append(args))
+    runner = SimpleNamespace(pp_handler=handler)
+    assert install_fixed_width_pp_sample_broadcast(runner) is is_last
+    if is_last:
+        payload = torch.arange(10).reshape(2, 5)
+        before = payload.clone()
+        with pytest.raises(ValueError, match="width exceeds"):
+            handler.broadcast(payload)
+        torch.testing.assert_close(payload, before)
+        assert calls == []
+
+
+@pytest.mark.parametrize("is_last", [False, True])
+def test_pp_mtp_missing_rank_metadata_fails_without_request_mutation(monkeypatch, is_last):
+    from vllm_hcu.v1 import hcu_model_runner_v2 as owner
+    handler = SimpleNamespace(is_last_rank=is_last, broadcast_group=object(),
+        main_stream=object(), broadcast_stream=SimpleNamespace(wait_stream=lambda _: None))
+    runner = SimpleNamespace(pp_handler=handler, num_speculative_steps=3, device="cpu",
+        req_states=SimpleNamespace(draft_tokens=torch.full((4, 3), 17, dtype=torch.int64)))
+    batch = SimpleNamespace(num_reqs=2, idx_mapping=torch.tensor([3, 1]))
+    before = runner.req_states.draft_tokens.clone()
+    monkeypatch.setattr(owner.torch.cuda, "stream", lambda _: contextlib.nullcontext())
+    monkeypatch.setattr(owner.torch.distributed, "broadcast",
+                        lambda *a, **kw: pytest.fail("missing source rank must not broadcast"))
+    with pytest.raises(AttributeError, match="last_rank"):
+        owner.synchronize_pp_spec_draft_tokens(runner, batch)
+    torch.testing.assert_close(runner.req_states.draft_tokens, before)
+
+
+def test_hyv4_mtp_pinned_speculator_keeps_owned_sampling_buffer_addresses():
+    from vllm.config.compilation import CUDAGraphMode
+    from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
+
+    obj = SimpleNamespace(
+        vllm_config=SimpleNamespace(compilation_config=SimpleNamespace(
+            cudagraph_mode=CUDAGraphMode.FULL)),
+        temperature=torch.zeros(4), seeds=torch.zeros(4, dtype=torch.int64),
+        idx_mapping=torch.zeros(4, dtype=torch.int32), draft_logits=torch.zeros(4, 2, 8),
+    )
+    pointers = [obj.temperature.data_ptr(), obj.seeds.data_ptr(), obj.idx_mapping.data_ptr()]
+    for temperature, seeds, indices in [([0., .5, 1., 1.5], [11, 22, 33, 44], [2, 0]),
+                                         ([1., 0., .5, 2.], [44, 33, 22, 11], [1])]:
+        temp = torch.tensor(temperature)
+        seed = torch.tensor(seeds)
+        idx = torch.tensor(indices, dtype=torch.int32)
+        DraftModelSpeculator._copy_request_inputs(obj, len(indices), idx, temp, seed)
+        assert [obj.temperature.data_ptr(), obj.seeds.data_ptr(), obj.idx_mapping.data_ptr()] == pointers
+        assert obj.temperature.data_ptr() != temp.data_ptr()
+        assert obj.seeds.data_ptr() != seed.data_ptr()
+        assert obj.temperature.tolist() == temperature
+        assert obj.seeds.tolist() == seeds
+        assert obj.idx_mapping.tolist() == indices + [-1] * (4 - len(indices))
+
+
+def test_hyv4_mtp_graph_replay_reads_updated_owned_sampling_buffers():
+    from vllm.config.compilation import CUDAGraphMode
+    from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
+
+    if not torch.cuda.is_available():
+        pytest.skip("requires HCU graph capture")
+    obj = SimpleNamespace(
+        vllm_config=SimpleNamespace(compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode.FULL)),
+        temperature=torch.zeros(4, device="cuda"), seeds=torch.zeros(4, dtype=torch.int64, device="cuda"),
+        idx_mapping=torch.zeros(4, dtype=torch.int32, device="cuda"), draft_logits=None,
+    )
+    output = torch.empty(4, device="cuda")
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        torch.add(obj.temperature, obj.seeds, out=output)
+    pointers = (obj.temperature.data_ptr(), obj.seeds.data_ptr(), obj.idx_mapping.data_ptr())
+    for temp, seed in [(0.5, 11), (1.5, 23)]:
+        DraftModelSpeculator._copy_request_inputs(obj, 1, torch.tensor([2], dtype=torch.int32, device="cuda"),
+            torch.full((4,), temp, device="cuda"), torch.full((4,), seed, dtype=torch.int64, device="cuda"))
+        graph.replay()
+        assert output.tolist() == [temp + seed] * 4
+        assert (obj.temperature.data_ptr(), obj.seeds.data_ptr(), obj.idx_mapping.data_ptr()) == pointers
+
+
+def test_hyv4_mtp_plain_pp_retains_pinned_broadcast_payloads(monkeypatch):
+    """Exercise PPHandler itself; only the distributed transport is replaced."""
+    from collections import deque
+    from vllm.v1.worker.gpu.pp_utils import PPHandler
+    from vllm_hcu.v1.hcu_model_runner_v2 import install_fixed_width_pp_sample_broadcast
+
+    if not torch.cuda.is_available():
+        pytest.skip("requires HCU streams")
+    sender, receiver = object.__new__(PPHandler), object.__new__(PPHandler)
+    for handler in (sender, receiver):
+        handler.last_rank = 1
+        handler.max_sample_len = 4
+        handler.device = torch.device("cuda")
+        handler.main_stream = torch.cuda.current_stream()
+        handler.broadcast_stream = torch.cuda.Stream()
+        handler.broadcast_group = object()
+        handler.req_idx_gen_np = np.zeros(4, dtype=np.int32)
+        handler.queue = deque([None])
+    receiver.broadcast_group = sender.broadcast_group
+    sender.is_last_rank, receiver.is_last_rank = True, False
+    runner = SimpleNamespace(pp_handler=sender)
+    install_fixed_width_pp_sample_broadcast(runner)
+    batch = SimpleNamespace(num_reqs=1, idx_mapping=torch.tensor([2], device="cuda"),
+        idx_mapping_np=np.array([2]), num_computed_tokens_np=np.array([3]),
+        prefill_len_np=np.array([3]), max_seq_len_np=np.array([10]),
+        num_scheduled_tokens=np.array([1]))
+    payloads = []
+    def send(tensor, *, src, group):
+        assert src == 1 and group is sender.broadcast_group
+        payloads.append(tensor.clone())
+    monkeypatch.setattr(torch.distributed, "broadcast", send)
+    sender.broadcast(torch.tensor([[41]], device="cuda"), torch.tensor([1], device="cuda", dtype=torch.int32),
+                     torch.tensor([0], device="cuda", dtype=torch.int32), batch)
+    sender.broadcast_stream.synchronize()
+    saved = list(payloads)
+    def receive(tensor, *, src, group):
+        assert src == 1 and group is receiver.broadcast_group
+        tensor.copy_(payloads.pop(0))
+    monkeypatch.setattr(torch.distributed, "broadcast", receive)
+    assert receiver.receive(batch) is True
+    output = receiver.get_prev_sampled_outputs()
+    assert not payloads
+    assert saved[0].tolist() == [[41, 0, 0, 0]]
+    assert saved[1].tolist() == [[1], [0]]
+    assert output["sampled_tokens"].tolist() == [[41, 0, 0, 0]]
+    assert output["num_sampled"].tolist() == [1]
+    assert output["num_rejected"].tolist() == [0]
+    assert output["idx_mapping"].tolist() == [2]
+
+
 def _fake_ubatch_module() -> ModuleType:
     @dataclasses.dataclass
     class UBatchSlice:
@@ -1900,13 +2332,15 @@ assert target_file.is_relative_to(target_root), (
 print('VLLM_SOURCE', vllm.__file__)
 from vllm_hcu.patch.worker.framework_opt import (
     patch_all2all, patch_base_device_communicator, patch_cuda_communicator,
-    patch_dp_utils, patch_eagle_utils, patch_forward_context,
+    patch_dp_utils, patch_draft_speculator_inputs, patch_eagle_utils,
+    patch_forward_context, patch_gpu_dp_utils,
     patch_gpu_ubatch_wrapper, patch_llm_base_proposer, patch_pynccl,
     patch_pynccl_wrapper, patch_ubatch_utils,
 )
 adapters = (
     patch_all2all, patch_base_device_communicator, patch_forward_context,
-    patch_llm_base_proposer, patch_dp_utils, patch_eagle_utils,
+    patch_llm_base_proposer, patch_dp_utils, patch_gpu_dp_utils,
+    patch_draft_speculator_inputs, patch_eagle_utils,
     patch_gpu_ubatch_wrapper, patch_ubatch_utils,
 )
 for adapter in adapters:

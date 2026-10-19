@@ -153,6 +153,36 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
         with deepep_auto_request_phase_scope():
             return super().execute_model(*args, **kwargs)
 
+    def profile_run(self) -> None:
+        """PCP-aware profile: dummy tokens per rank = max_num_batched_tokens / pcp_size.
+
+        Upstream ``GPUModelRunner.profile_run`` sends ``self.max_num_tokens``
+        (= scheduler_config.max_num_batched_tokens) into ``_dummy_run`` as the
+        per-rank token count.  In PCP, the scheduler's total batch is split
+        across ``pcp_size`` ranks, so each rank actually processes at most
+        ``max_num_batched_tokens / pcp_size`` tokens.  Profiling with the full
+        value inflates MoE / attention workspaces by up to ``pcp_size``, which
+        under DeepEP-HT reserves ``4 * M * K * 2`` bytes per rank and can push
+        the peak past the GPU capacity for PCP+EP configs.
+        """
+        pcp_size = int(
+            getattr(
+                self.vllm_config.parallel_config,
+                "prefill_context_parallel_size",
+                1,
+            )
+            or 1
+        )
+        if pcp_size <= 1:
+            return super().profile_run()
+
+        original_max = self.max_num_tokens
+        self.max_num_tokens = max(1, (original_max // pcp_size) * 9 // 8)
+        try:
+            return super().profile_run()
+        finally:
+            self.max_num_tokens = original_max
+
     def prepare_attn(self, input_batch):
         if self.pcp_manager is None:
             return super().prepare_attn(input_batch)
@@ -173,12 +203,22 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
         execute_model_state = self.execute_model_state
         use_replicated_mtp_batch = False
         if self.pcp_manager is not None and execute_model_state is not None:
-            (
-                restored_hidden_states,
-                restored_input_batch,
-            ) = self.pcp_manager.restore_for_sampling(
-                execute_model_state.hidden_states
-            )
+            if (
+                execute_model_state.hidden_states is None
+                and not self.is_last_pp_rank
+            ):
+                # Upstream PP receive consumes the global request batch. This
+                # stage produced IntermediateTensors, so there is no final
+                # hidden-state tensor to gather across its PCP group.
+                restored_hidden_states = None
+                restored_input_batch = self.pcp_manager.restore_global_batch()
+            else:
+                (
+                    restored_hidden_states,
+                    restored_input_batch,
+                ) = self.pcp_manager.restore_for_sampling(
+                    execute_model_state.hidden_states
+                )
             execute_model_state = execute_model_state._replace(
                 hidden_states=restored_hidden_states,
                 input_batch=restored_input_batch,

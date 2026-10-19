@@ -9,6 +9,39 @@ import torch
 from vllm_hcu.patch.config import HcuFeatureConfig
 
 
+def _dcp_a2a_lse_reduce_with_overlap(
+    reduce_fn,
+    self,
+    *args,
+    **kwargs,
+):
+    """Run g_proj only across the DCP A2A combine window when configured."""
+    overlap_fn = getattr(self, "_hcu_dcp_a2a_overlap_fn", None)
+    aux_stream = getattr(self, "_hcu_dcp_a2a_overlap_stream", None)
+    if overlap_fn is None or aux_stream is None:
+        return reduce_fn(*args, **kwargs)
+
+    start_event = getattr(self, "_hcu_dcp_a2a_overlap_start_event", None)
+    done_event = getattr(self, "_hcu_dcp_a2a_overlap_done_event", None)
+    if start_event is None or done_event is None:
+        raise RuntimeError("DCP A2A overlap requires persistent CUDA events")
+
+    current_stream = torch.cuda.current_stream()
+    # forward_mqa has already queued the local attention on current_stream.
+    # Gate execution starts only after that work, while the current stream
+    # enters the A2A pack/communication/unpack path.
+    start_event.record(current_stream)
+    with torch.cuda.stream(aux_stream):
+        aux_stream.wait_event(start_event)
+        overlap_fn()
+        done_event.record(aux_stream)
+
+    result = reduce_fn(*args, **kwargs)
+    # Join before _v_up_proj so g_proj does not contend with that GEMM.
+    current_stream.wait_event(done_event)
+    return result
+
+
 def lightly_cp_mla_wrapper_forward(
     self,
     positions: torch.Tensor,
@@ -94,6 +127,7 @@ def mla_forward_impl(
     quant_scale_ue8m0=None,
     quant_col_major=None,
     quant_tma_aligned=None,
+    q_dcp_replicated=None,
 ):
     """v0.25.1 target MLA forward plus HCU Lightly-CP KV length and CAT support."""
 
@@ -125,6 +159,8 @@ def mla_forward_impl(
     output_padded = output
     output = output[:num_actual_toks, ...]
     q = q[:num_actual_toks, ...]
+    if q_dcp_replicated is not None:
+        q_dcp_replicated = q_dcp_replicated[:num_actual_toks, ...]
     k_c_normed = k_c_normed[:num_kv_actual_toks, ...]
     k_pe = k_pe[:num_kv_actual_toks, ...]
     if fp8_attention and self.kv_cache_dtype != "fp8_ds_mla":
@@ -147,7 +183,12 @@ def mla_forward_impl(
             output=output[num_mqa_tokens:],
         )
     if num_mqa_tokens > 0:
-        mqa_q = q[:num_mqa_tokens]
+        qrep_decode = q_dcp_replicated is not None
+        mqa_q = (
+            q_dcp_replicated[:num_mqa_tokens]
+            if qrep_decode
+            else q[:num_mqa_tokens]
+        )
         mqa_output_slice = output[:num_mqa_tokens]
         mqa_q_nope, mqa_q_pe = mqa_q.split(
             [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
@@ -173,13 +214,20 @@ def mla_forward_impl(
             )
         else:
             N, B, _ = mqa_q_nope.shape
-            L = self.W_UK_T.shape[-1]
+            W_UK_T = (
+                self.W_UK_T_dcp_qrep if qrep_decode else self.W_UK_T
+            )
+            if W_UK_T is None:
+                raise RuntimeError(
+                    "DCP query replication weights were not prepared"
+                )
+            L = W_UK_T.shape[-1]
             if self.q_pad_num_heads is not None:
                 mqa_ql_nope = mqa_q_nope.new_empty((self.q_pad_num_heads, B, L))
                 mqa_ql_nope.resize_((N, B, L))
             else:
                 mqa_ql_nope = mqa_q_nope.new_empty((N, B, L))
-            torch.bmm(mqa_q_nope, self.W_UK_T, out=mqa_ql_nope)
+            torch.bmm(mqa_q_nope, W_UK_T, out=mqa_ql_nope)
             mqa_ql_nope = mqa_ql_nope.transpose(0, 1)
         from vllm_hcu.platforms.hcu import on_gfx938
 
@@ -201,10 +249,12 @@ def mla_forward_impl(
         else:
             mqa_q = (mqa_ql_nope, mqa_q_pe)
         if self.impl.dcp_world_size > 1:
-            if fp8_attention:
+            if fp8_attention and not qrep_decode:
                 raise RuntimeError("HCU MLA DCP does not support FP8 KV cache")
-            mqa_q = torch.cat(mqa_q, dim=-1)
-            mqa_q = upstream.get_dcp_group().all_gather(mqa_q, dim=1)
+            if isinstance(mqa_q, tuple):
+                mqa_q = torch.cat(mqa_q, dim=-1)
+            if not qrep_decode:
+                mqa_q = upstream.get_dcp_group().all_gather(mqa_q, dim=1)
         if not is_sparse_impl and attn_metadata.decode is None:
             raise RuntimeError("HCU MLA decode metadata is missing")
         attn_out, lse = self.impl.forward_mqa(
@@ -212,8 +262,17 @@ def mla_forward_impl(
         )
         if self.impl.dcp_world_size > 1:
             if self.dcp_a2a:
-                attn_out = upstream.dcp_a2a_lse_reduce(
-                    attn_out, lse, upstream.get_dcp_group(),
+                reduce_fn = getattr(
+                    upstream,
+                    "_vllm_hcu_original_dcp_a2a_lse_reduce",
+                    upstream.dcp_a2a_lse_reduce,
+                )
+                attn_out = _dcp_a2a_lse_reduce_with_overlap(
+                    reduce_fn,
+                    self,
+                    attn_out,
+                    lse,
+                    upstream.get_dcp_group(),
                     is_lse_base_on_e=not getattr(self, "_use_fi_prefill", False),
                 )
             else:

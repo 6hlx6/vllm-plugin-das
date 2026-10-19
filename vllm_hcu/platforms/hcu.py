@@ -26,6 +26,35 @@ import vllm_hcu.platforms.envs as henvs
 
 logger = init_logger(__name__)
 
+_HYV4_FULL_DCP_ARCHITECTURES = frozenset({"HYV4ForCausalLM"})
+_HYV4_FULL_DCP_BACKENDS = frozenset({"ag_rs", "a2a"})
+
+
+def _supports_full_decode_cudagraph_with_dcp(vllm_config: "VllmConfig") -> bool:
+    """Return whether the model's DCP path is validated for full decode graphs."""
+    from vllm.config.compilation import CUDAGraphMode, CompilationMode
+
+    architectures = getattr(vllm_config.model_config, "architectures", ()) or ()
+    dcp_backend = getattr(vllm_config.parallel_config, "dcp_comm_backend", None)
+    requested_mode = vllm_config.compilation_config.cudagraph_mode
+    compilation_mode = vllm_config.compilation_config.mode
+    uses_validated_graph_mode = (
+        requested_mode is CUDAGraphMode.FULL
+        and compilation_mode is CompilationMode.NONE
+    ) or (
+        requested_mode is CUDAGraphMode.FULL_AND_PIECEWISE
+        and compilation_mode is CompilationMode.NONE
+        and envs.VLLM_USE_BREAKABLE_CUDAGRAPH
+    )
+    return (
+        uses_validated_graph_mode
+        and dcp_backend in _HYV4_FULL_DCP_BACKENDS
+        and any(
+            architecture in _HYV4_FULL_DCP_ARCHITECTURES
+            for architecture in architectures
+        )
+    )
+
 _ensure_platform_plugin_ready()
 
 
@@ -234,6 +263,7 @@ class HCUPlatform(Platform):
         "online",
         # "gpt_oss_mxfp4",
         "slimquant_w4a8",
+        "kimi_k3_w4a8",
         "slimquant_w4a8_marlin", 
         "slimquant_compressed_tensors_marlin",
     ]
@@ -408,9 +438,26 @@ class HCUPlatform(Platform):
     
     @classmethod
     def use_custom_allreduce(cls) -> bool:
-        # We only enable custom allreduce for MI300 series
-        # return any(gfx in _GCN_ARCH for gfx in ["gfx94", "gfx95"])
-        return True
+        # Enable HCU P2P by default, with an explicit RCCL/NCCL opt-out.
+        return henvs.VLLM_HCU_USE_CUSTOM_ALLREDUCE
+
+    @classmethod
+    def get_default_ir_op_priority(
+        cls, vllm_config: "VllmConfig"
+    ) -> "IrOpPriorityConfig":
+        from vllm.config.kernel import IrOpPriorityConfig
+        from vllm_hcu.runtime_compat.kimi_k3_loading import is_kimi_k3_config
+
+        if not is_kimi_k3_config(vllm_config):
+            return super().get_default_ir_op_priority(vllm_config)
+
+        # HCU Kimi runs may request torch.compile but fall back at runtime.
+        # Prefer the same ROCm C kernels used by the source path rather than
+        # selecting native decomposition solely from the requested mode.
+        default = ["vllm_c", "native"]
+        return IrOpPriorityConfig.with_default(
+            default, rms_norm=default, fused_add_rms_norm=default
+        )
     
     @classmethod
     def device_count(cls) -> int:
@@ -565,8 +612,12 @@ class HCUPlatform(Platform):
         # if cache_config and cache_config.block_size is None:
         #     cache_config.block_size = 64
         if compilation_config.cudagraph_mode.has_full_cudagraphs():
-            # decode context parallel does not support full cudagraphs
-            if parallel_config.decode_context_parallel_size > 1:
+            # Full DCP decode graphs are limited to the validated HY4 AG+RS
+            # and A2A paths. Keep every other DCP configuration on PIECEWISE.
+            if (
+                parallel_config.decode_context_parallel_size > 1
+                and not _supports_full_decode_cudagraph_with_dcp(vllm_config)
+            ):
                 logger.warning_once(
                     "Decode context parallel (DCP) is enabled, which is "
                     "incompatible with full CUDA graphs. "
@@ -581,6 +632,12 @@ class HCUPlatform(Platform):
                     "Overriding cudagraph_mode to PIECEWISE."
                 )
                 compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+            elif parallel_config.decode_context_parallel_size > 1:
+                logger.info_once(
+                    "HY4 DCP is retaining its validated full CUDA graph mode. "
+                    "Attention backend capability checks may narrow it to "
+                    "full decode graphs."
+                )
 
         if cache_config and not cache_config.user_specified_block_size:
             backend = vllm_config.attention_config.backend

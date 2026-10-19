@@ -71,6 +71,101 @@ def _load_v32_sparse_indexer_contract(**dependencies):
     return namespace["forward_hip"]
 
 
+def _load_hcu_sparse_indexer_contract(**dependencies):
+    source = (
+        REPO / "vllm_hcu/model_executor/layers/sparse_attn_indexer.py"
+    ).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    function = copy.deepcopy(
+        next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "hcu_sparse_attn_indexer"
+        )
+    )
+    function.decorator_list = []
+    module = ast.Module(body=[function], type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace = dict(dependencies)
+    exec(compile(module, "hcu_sparse_attn_indexer", "exec"), namespace)
+    return namespace["hcu_sparse_attn_indexer"]
+
+
+def _load_sparse_indexer_contract(**dependencies):
+    source = (
+        REPO / "vllm_hcu/model_executor/layers/sparse_attn_indexer.py"
+    ).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    class_node = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "SparseAttnIndexer"
+    )
+    method = copy.deepcopy(
+        next(
+            node
+            for node in class_node.body
+            if isinstance(node, ast.FunctionDef) and node.name == "forward_hip"
+        )
+    )
+    method.decorator_list = []
+    module = ast.Module(body=[method], type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace = dict(dependencies)
+    exec(compile(module, "sparse_indexer_forward_hip", "exec"), namespace)
+    return namespace["forward_hip"]
+
+
+def test_hcu_sparse_indexer_uses_explicit_dcp_config_outside_runtime_context():
+    calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def native_wrapper(*args, **kwargs):
+        calls.append((args, kwargs))
+        return "topk"
+
+    hcu_sparse_attn_indexer = _load_hcu_sparse_indexer_contract(
+        torch=torch,
+        LayerNameType=str,
+        get_current_vllm_config=lambda: pytest.fail(
+            "forward-time custom op read the global vLLM config"
+        ),
+        get_dcp_group=lambda: pytest.fail(
+            "forward-time custom op resolved the DCP process group"
+        ),
+        rocm_aiter_sparse_attn_indexer_native=native_wrapper,
+    )
+
+    result = hcu_sparse_attn_indexer(
+        object(),
+        "layer",
+        object(),
+        object(),
+        object(),
+        object(),
+        128,
+        "float32",
+        2048,
+        128,
+        65536,
+        65536,
+        object(),
+        True,
+        3,
+        4,
+        256,
+    )
+
+    assert result == "topk"
+    assert len(calls) == 1
+    assert calls[0][1] == {
+        "skip_k_cache_insert": True,
+        "dcp_rank": 3,
+        "dcp_world_size": 4,
+        "cp_kv_cache_interleave_size": 256,
+    }
+
+
 def _load_v32_sparse_indexer_class():
     source = (
         REPO / "vllm_hcu/model_executor/layers/sparse_attn_indexer.py"
@@ -90,6 +185,153 @@ def _load_v32_sparse_indexer_class():
     namespace = {"torch": torch, "SparseAttnIndexer": object}
     exec(compile(module, "v32_sparse_indexer_class", "exec"), namespace)
     return namespace["V32SparseAttnIndexer"]
+
+
+@pytest.mark.parametrize(
+    "missing_field",
+    ["dcp_rank", "dcp_world_size", "cp_kv_cache_interleave_size"],
+)
+def test_sparse_indexer_rejects_missing_dcp_configuration(missing_field: str):
+    """The shared HIP path must also reject an incomplete indexer instance."""
+
+    fake_torch = SimpleNamespace(
+        Tensor=torch.Tensor,
+        ops=SimpleNamespace(
+            vllm=SimpleNamespace(
+                rocm_aiter_sparse_attn_indexer=lambda *_args, **_kwargs: pytest.fail(
+                    "incomplete DCP configuration reached the native kernel"
+                )
+            )
+        ),
+    )
+    forward_hip = _load_sparse_indexer_contract(
+        torch=fake_torch,
+        henvs=SimpleNamespace(
+            VLLM_HCU_USE_CUSTOM_OPS=False,
+            VLLM_HCU_USE_AITER_OPUS_PAGED_MQA_LOGITS=False,
+        ),
+        rocm_aiter_ops=SimpleNamespace(is_enabled=lambda: True),
+        _encode_layer_name=lambda value: value,
+    )
+    indexer = SimpleNamespace(
+        dcp_rank=0,
+        dcp_world_size=1,
+        cp_kv_cache_interleave_size=1,
+        skip_k_cache_insert=False,
+        use_fp4_cache=False,
+        k_cache=SimpleNamespace(prefix="layer", kv_cache=object()),
+        quant_block_size=128,
+        scale_fmt="float32",
+        topk_tokens=2048,
+        head_dim=128,
+        max_model_len=8192,
+        max_total_seq_len=8192,
+        topk_indices_buffer=object(),
+    )
+    delattr(indexer, missing_field)
+
+    with pytest.raises(AttributeError, match=missing_field):
+        forward_hip(
+            indexer,
+            object(),
+            torch.empty((1, 32, 128), dtype=torch.float8_e4m3fn),
+            object(),
+            object(),
+        )
+
+
+def test_aiter_opus_flag_routes_sparse_indexer_through_native_wrapper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def native_wrapper(*args, **kwargs):
+        calls.append((args, kwargs))
+        return "native-topk"
+
+    module_name = "vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse"
+    fake_module = ModuleType(module_name)
+    fake_module.rocm_aiter_sparse_attn_indexer_native = native_wrapper
+    monkeypatch.setitem(sys.modules, module_name, fake_module)
+    monkeypatch.setattr(
+        torch.ops.vllm,
+        "rocm_aiter_sparse_attn_indexer",
+        lambda *_args, **_kwargs: pytest.fail("legacy AITER indexer was selected"),
+        raising=False,
+    )
+
+    forward_hip = _load_sparse_indexer_contract(
+        torch=torch,
+        henvs=SimpleNamespace(
+            VLLM_HCU_USE_CUSTOM_OPS=True,
+            VLLM_HCU_USE_AITER_OPUS_PAGED_MQA_LOGITS=True,
+        ),
+        rocm_aiter_ops=SimpleNamespace(is_enabled=lambda: True),
+        _encode_layer_name=lambda value: value,
+    )
+    indexer = SimpleNamespace(
+        dcp_rank=0,
+        dcp_world_size=1,
+        cp_kv_cache_interleave_size=1,
+        skip_k_cache_insert=False,
+        use_fp4_cache=False,
+        k_cache=SimpleNamespace(prefix="layer", kv_cache=object()),
+        quant_block_size=128,
+        scale_fmt="float32",
+        topk_tokens=2048,
+        head_dim=128,
+        max_model_len=8192,
+        max_total_seq_len=8192,
+        topk_indices_buffer=object(),
+    )
+    q_quant = torch.empty((1, 32, 128), dtype=torch.float8_e4m3fn)
+
+    assert forward_hip(indexer, object(), q_quant, object(), object()) == "native-topk"
+    assert len(calls) == 1
+    assert calls[0][1] == {"skip_k_cache_insert": False}
+
+
+def test_aiter_opus_flag_does_not_route_native_when_custom_ops_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        torch.ops.vllm,
+        "rocm_aiter_sparse_attn_indexer",
+        lambda *_args, **_kwargs: "legacy-aiter",
+        raising=False,
+    )
+    forward_hip = _load_sparse_indexer_contract(
+        torch=torch,
+        henvs=SimpleNamespace(
+            VLLM_HCU_USE_CUSTOM_OPS=False,
+            VLLM_HCU_USE_AITER_OPUS_PAGED_MQA_LOGITS=True,
+        ),
+        rocm_aiter_ops=SimpleNamespace(is_enabled=lambda: True),
+        _encode_layer_name=lambda value: value,
+    )
+    indexer = SimpleNamespace(
+        dcp_rank=0,
+        dcp_world_size=1,
+        cp_kv_cache_interleave_size=1,
+        skip_k_cache_insert=False,
+        use_fp4_cache=False,
+        k_cache=SimpleNamespace(prefix="layer", kv_cache=object()),
+        quant_block_size=128,
+        scale_fmt="float32",
+        topk_tokens=2048,
+        head_dim=128,
+        max_model_len=8192,
+        max_total_seq_len=8192,
+        topk_indices_buffer=object(),
+    )
+
+    assert forward_hip(
+        indexer,
+        object(),
+        torch.empty((1, 32, 128), dtype=torch.float8_e4m3fn),
+        object(),
+        object(),
+    ) == "legacy-aiter"
 
 
 @pytest.mark.parametrize("dtype", [torch.int8, torch.float8_e4m3fn])
@@ -242,6 +484,9 @@ def test_v32_pcp_gathers_k_and_slots_before_hcu_cache_insertion():
         use_fp4_cache=False,
         use_pcp=True,
         pcp_world_size=2,
+        dcp_rank=3,
+        dcp_world_size=4,
+        cp_kv_cache_interleave_size=256,
         skip_k_cache_insert=False,
         k_cache=SimpleNamespace(prefix="indexer", kv_cache=cache),
         quant_block_size=128,
@@ -268,7 +513,7 @@ def test_v32_pcp_gathers_k_and_slots_before_hcu_cache_insertion():
     assert hcu_args[4] is local_k
     assert hcu_args[5] is weights
     assert hcu_args[8] == 2048
-    assert hcu_args[-1] is True
+    assert hcu_args[-4:] == (True, 3, 4, 256)
 
 
 def test_v32_replicated_mtp_batch_bypasses_static_pcp_indexer_state():
@@ -310,6 +555,9 @@ def test_v32_replicated_mtp_batch_bypasses_static_pcp_indexer_state():
         use_fp4_cache=False,
         use_pcp=True,
         pcp_world_size=2,
+        dcp_rank=0,
+        dcp_world_size=1,
+        cp_kv_cache_interleave_size=1,
         skip_k_cache_insert=False,
         k_cache=SimpleNamespace(prefix="indexer", kv_cache=object()),
         quant_block_size=128,
@@ -324,11 +572,168 @@ def test_v32_replicated_mtp_batch_bypasses_static_pcp_indexer_state():
     assert forward_hip(indexer, object(), q_quant, local_k, object()) == "topk"
     assert len(calls) == 1
     assert calls[0][4] is local_k
-    assert calls[0][-1] is False
+    assert calls[0][-4:] == (False, 0, 1, 1)
+
+
+@pytest.mark.parametrize(
+    "missing_field",
+    ["dcp_rank", "dcp_world_size", "cp_kv_cache_interleave_size"],
+)
+def test_v32_hcu_indexer_rejects_missing_dcp_configuration(
+    missing_field: str,
+):
+    """Reject incomplete configuration before PCP cache or kernel side effects."""
+
+    fake_torch = SimpleNamespace(
+        Tensor=torch.Tensor,
+        ops=SimpleNamespace(
+            vllm=SimpleNamespace(
+                hcu_sparse_attn_indexer=lambda *_args: pytest.fail(
+                    "incomplete DCP configuration reached the native kernel"
+                )
+            )
+        ),
+    )
+    forward_hip = _load_v32_sparse_indexer_contract(
+        torch=fake_torch,
+        effective_pcp_world_size=lambda value: value,
+        get_forward_context=lambda: pytest.fail(
+            "incomplete DCP configuration inspected PCP metadata"
+        ),
+        maybe_gather_indexer_k=lambda *_args: pytest.fail(
+            "incomplete DCP configuration gathered PCP inputs"
+        ),
+        ops=SimpleNamespace(
+            indexer_k_quant_and_cache=lambda *_args: pytest.fail(
+                "incomplete DCP configuration mutated the PCP cache"
+            )
+        ),
+        on_gfx938=lambda: True,
+        indexer_k_bf16_cache_triton=lambda *_args: pytest.fail(
+            "incomplete DCP configuration mutated the PCP cache"
+        ),
+        _encode_layer_name=lambda value: value,
+    )
+    indexer = SimpleNamespace(
+        use_fp4_cache=False,
+        pcp_world_size=2,
+        dcp_rank=0,
+        dcp_world_size=1,
+        cp_kv_cache_interleave_size=1,
+        skip_k_cache_insert=False,
+        k_cache=SimpleNamespace(prefix="indexer", kv_cache=object()),
+        quant_block_size=128,
+        scale_fmt="e8m0",
+        topk_tokens=2048,
+        head_dim=128,
+        max_model_len=65536,
+        max_total_seq_len=65536,
+        topk_indices_buffer=object(),
+    )
+    delattr(indexer, missing_field)
+
+    with pytest.raises(AttributeError, match=missing_field):
+        forward_hip(
+            indexer,
+            object(),
+            torch.ones(1, 2),
+            torch.ones(1, 2),
+            object(),
+        )
 
 
 def test_v32_hcu_indexer_impl_advertises_pcp_capability():
     assert _load_v32_sparse_indexer_class().supports_pcp is True
+
+
+@pytest.mark.parametrize("rank", range(4))
+@pytest.mark.parametrize("gfx938", [False, True])
+def test_hyv4_pcp4_indexer_keeps_slots_and_local_topk_order(
+    monkeypatch, rank, gfx938,
+):
+    """Cache gathers must not reorder Q/top-k or repeat replicated decode writes."""
+    from vllm_hcu.model_executor.layers.attention import pcp
+
+    rank_k = [torch.tensor(values, dtype=torch.float32).reshape(3, 1) for values in (
+        [500, 100, 107], [500, 101, 106], [500, 102, 105], [500, 103, 104],
+    )]
+    slots = torch.tensor([50, 10, 17, -1, 11, 16, -1, 12, 15, -1, 13, 14])
+    metadata = SimpleNamespace(
+        slot_mapping=slots, pcp_world_size=4, num_decode_tokens=1, num_prefills=2,
+    )
+    events = []
+
+    def gather(tensor, dim=0):
+        assert dim == 0
+        if tensor.ndim == 2:
+            torch.testing.assert_close(tensor, rank_k[rank][1:])
+            events.append("gather_k")
+            return torch.cat([values[1:] for values in rank_k])
+        torch.testing.assert_close(tensor, slots.reshape(4, 3)[rank, 1:])
+        events.append("gather_slots")
+        return slots.reshape(4, 3)[:, 1:].reshape(-1)
+
+    monkeypatch.setattr(pcp, "get_pcp_group", lambda: SimpleNamespace(
+        rank_in_group=rank, world_size=4, all_gather=gather,
+    ))
+    cache = {}
+
+    def cache_insert(k, actual_cache, cache_slots, *args):
+        assert actual_cache is cache
+        assert k[:, 0].tolist() == [500, 100, 107, 101, 106, 102, 105, 103, 104]
+        assert cache_slots.tolist() == [50, 10, 17, 11, 16, 12, 15, 13, 14]
+        actual_cache.update(zip(cache_slots.tolist(), k[:, 0].tolist()))
+        events.append("cache")
+
+    local_k = rank_k[rank]
+    q = local_k.clone()
+    hidden_states = local_k + 1000
+    weights = torch.ones_like(local_k)
+    topk_buffer = torch.full((5, 2), -77, dtype=torch.int32)
+    storage = topk_buffer.data_ptr()
+
+    def hcu_op(*args):
+        assert args[0] is hidden_states
+        assert args[3] is q
+        assert args[4] is local_k
+        assert args[5] is weights
+        assert args[-5] is topk_buffer
+        assert args[-4:] == (True, 0, 1, 1)
+        assert events == ["gather_k", "gather_slots", "cache"]
+        # Deterministic local query result; the custom-op/kernel is the hardware
+        # boundary. Only local rows can be published to the shared stage buffer.
+        topk_buffer[:3] = q.to(torch.int32).expand(3, 2)
+        events.append("topk")
+        return topk_buffer
+
+    forward_hip = _load_v32_sparse_indexer_contract(
+        torch=SimpleNamespace(Tensor=torch.Tensor,
+            ops=SimpleNamespace(vllm=SimpleNamespace(hcu_sparse_attn_indexer=hcu_op))),
+        effective_pcp_world_size=pcp.effective_pcp_world_size,
+        get_forward_context=lambda: SimpleNamespace(attn_metadata={"indexer": metadata}),
+        maybe_gather_indexer_k=pcp.maybe_gather_indexer_k,
+        ops=SimpleNamespace(indexer_k_quant_and_cache=cache_insert),
+        on_gfx938=lambda: gfx938,
+        indexer_k_bf16_cache_triton=cache_insert,
+        _encode_layer_name=lambda value: value,
+    )
+    indexer = SimpleNamespace(
+        use_fp4_cache=False,
+        pcp_world_size=4,
+        dcp_rank=0,
+        dcp_world_size=1,
+        cp_kv_cache_interleave_size=1,
+        skip_k_cache_insert=False,
+        k_cache=SimpleNamespace(prefix="indexer", kv_cache=cache),
+        quant_block_size=128, scale_fmt="e8m0", topk_tokens=2, head_dim=128,
+        max_model_len=64, max_total_seq_len=64, topk_indices_buffer=topk_buffer,
+    )
+    result = forward_hip(indexer, hidden_states, q, local_k, weights)
+    assert result is topk_buffer and result.data_ptr() == storage
+    assert result[:, 0].tolist() == rank_k[rank][:, 0].tolist() + [-77, -77]
+    assert cache == {50: 500, 10: 100, 11: 101, 12: 102, 13: 103,
+                     14: 104, 15: 105, 16: 106, 17: 107}
+    assert events == ["gather_k", "gather_slots", "cache", "topk"]
 
 
 def test_indexer_metadata_adapter_propagates_pcp_world_size():
@@ -614,6 +1019,9 @@ def test_v32_pcp_one_preserves_existing_hcu_custom_op_ownership():
         use_fp4_cache=False,
         use_pcp=False,
         pcp_world_size=1,
+        dcp_rank=0,
+        dcp_world_size=1,
+        cp_kv_cache_interleave_size=1,
         skip_k_cache_insert=False,
         k_cache=SimpleNamespace(prefix="indexer", kv_cache=object()),
         quant_block_size=128,
@@ -628,4 +1036,4 @@ def test_v32_pcp_one_preserves_existing_hcu_custom_op_ownership():
     assert forward_hip(indexer, object(), q_quant, local_k, object()) == "topk"
     assert len(calls) == 1
     assert calls[0][4] is local_k
-    assert calls[0][-1] is False
+    assert calls[0][-4:] == (False, 0, 1, 1)

@@ -8,12 +8,13 @@
   "rocm": {
     "environment": "ROCM_PATH",
     "version_file": ".info/rocm_version",
+    "match": "prefix",
     "version": "26.04"
   },
   "distributions": {
     "torch": {
       "match": "prefix",
-      "version": "2.11.0+das.opt1.dtk2604."
+      "version": "2.11.0"
     },
     "vllm": {
       "match": "prefix",

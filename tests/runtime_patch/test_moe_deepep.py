@@ -148,11 +148,13 @@ def test_all2all_dispatch_selection_contract():
         return hidden_size
 
     fp8_dtype = torch.float8_e4m3fn
+    manager = SimpleNamespace()
     module = _module(
         patch_all2all_utils.TARGET_MODULE,
         torch=torch,
         current_platform=SimpleNamespace(fp8_dtype=lambda: fp8_dtype),
         DeepEPLLPrepareAndFinalize=DeepEPLLPrepareAndFinalize,
+        get_ep_all2all_manager=lambda eep_stage: manager,
         maybe_make_prepare_finalize=maybe_make_prepare_finalize,
         maybe_roundup_layer_hidden_size=maybe_roundup_layer_hidden_size,
     )
@@ -161,7 +163,9 @@ def test_all2all_dispatch_selection_contract():
 
     fp8_config = SimpleNamespace(quant_dtype=fp8_dtype)
     moe = SimpleNamespace(
-        moe_parallel_config=SimpleNamespace(use_deepep_auto_kernels=False)
+        moe_parallel_config=SimpleNamespace(use_deepep_auto_kernels=False,
+                                           use_deepep_ll_kernels=True),
+        experts_per_token=16,
     )
     result = module.maybe_make_prepare_finalize(moe, fp8_config)
     assert result is prepare_finalize
@@ -172,6 +176,7 @@ def test_all2all_dispatch_selection_contract():
     result = module.maybe_make_prepare_finalize(moe, int8_config)
     assert result.use_fp8_dispatch is False
     assert result.use_int8_dispatch is True
+    assert manager._vllm_hcu_ll_num_topk == 16
 
 
 @pytest.mark.parametrize(
@@ -1750,6 +1755,8 @@ def test_moe_layer_forward_and_repacked_weight_contract(
     class Runner:
         def __init__(self, apply_router_weight_on_input=False):
             self.routed_experts = RoutedExperts(apply_router_weight_on_input)
+            self.moe_config = SimpleNamespace(activation="silu")
+            self.routed_experts.activation = "silu"
             self.replaced = None
 
         def _replace_quant_method(self, method):
@@ -1819,6 +1826,11 @@ def test_moe_layer_forward_and_repacked_weight_contract(
     )
     assert fused_moe_package.FusedMoE is layer_module.FusedMoE
     runner = fused_moe_package.FusedMoE()
+    situ_runner = fused_moe_package.FusedMoE(
+        activation="situ", activation_situ_beta=4., activation_situ_linear_beta=25.,
+    )
+    assert situ_runner.routed_experts.activation is situ_runner.moe_config.activation
+    assert situ_runner.routed_experts.activation.value == "situ"
     experts = runner.routed_experts
     assert isinstance(experts.quant_method, HcuUnquantizedFusedMoEMethod)
     assert experts.quant_method.moe_quant_config == "official-config"
@@ -4123,10 +4135,25 @@ def test_router_factory_feature_gated_hcu_subclass_contract(
     lightop_calls: list[tuple[object, ...]] = []
     lightop_gate_kwargs: list[dict[str, object]] = []
 
-    def moe_fused_gate(router_logits, *args, **kwargs):
+    def moe_fused_gate(
+        router_logits,
+        *args,
+        output_indices_int64=False,
+        **kwargs,
+    ):
         lightop_calls.append((router_logits, *args))
-        lightop_gate_kwargs.append(kwargs)
-        routed.append((router_logits, torch.tensor([[3]], dtype=torch.int64)))
+        lightop_gate_kwargs.append(
+            {
+                **kwargs,
+                **(
+                    {"output_indices_int64": True}
+                    if output_indices_int64
+                    else {}
+                ),
+            }
+        )
+        ids_dtype = torch.int64 if output_indices_int64 else torch.int32
+        routed.append((router_logits, torch.tensor([[3]], dtype=ids_dtype)))
         return torch.ones((1, 1)), routed[-1][1]
 
     lightop_moe = _install_lightop_moe(
@@ -4149,6 +4176,30 @@ def test_router_factory_feature_gated_hcu_subclass_contract(
     router._compute_routing(None, logits, torch.int32)
     assert lightop_calls[-1][-2:] == (2.827, True)
     assert lightop_gate_kwargs[-1] == {}
+
+    # HY4 uses the group=1 LightOp specialization and DeepEP LL requests
+    # int64 expert ids. A recent LightOp can produce that dtype directly,
+    # avoiding a separate int32-to-int64 elementwise conversion.
+    router.num_expert_group = 1
+    router.topk_group = 1
+    router.top_k = 8
+    hyv4_logits = torch.ones((16, 256))
+    _, ids = router._compute_routing(None, hyv4_logits, torch.int64)
+    assert ids.dtype == torch.int64
+    assert lightop_gate_kwargs[-1] == {"output_indices_int64": True}
+
+    # Older LightOp builds do not expose the dtype switch. Keep their ABI and
+    # retain the existing post-kernel conversion instead of passing a new kwarg.
+    def legacy_moe_fused_gate(router_logits, *args):
+        del args
+        return torch.ones((1, 1)), torch.tensor([[3]], dtype=torch.int32)
+
+    lightop_moe.moe_fused_gate = legacy_moe_fused_gate
+    _, legacy_ids = router._compute_routing(None, hyv4_logits, torch.int64)
+    assert legacy_ids.dtype == torch.int64
+    lightop_moe.moe_fused_gate = moe_fused_gate
+    router.num_expert_group = 2
+    router.top_k = 1
 
     # The installed LightOp has no routing-capability hook, so an unsupported
     # mode must use the official router and must not invoke the fixed
@@ -4712,6 +4763,34 @@ def test_deepep_ll_hcu_int8_dispatch_contract(
     else:
         assert calls["order"] == expected_dispatches
 
+    # Only explicit LL-only ownership can reuse a clean layout. A layout or
+    # buffer change must clean again; other models keep the behavior above.
+    instance._vllm_hcu_clean_low_latency_buffer = False
+    instance._hcu_ll_cleaned_buffer_layout = None
+    calls["order"].clear()
+    for _ in range(2):
+        instance.prepare_async(hidden, topk_weights, topk_ids, 1, None, False, quant_config)
+    assert calls["order"] == [
+        ("clean", (8, 2048, 1, 0)), ("dispatch", 1), ("dispatch", 1)
+    ]
+    instance.max_tokens_per_rank = 16
+    instance.prepare_async(hidden, topk_weights, topk_ids, 1, None, False, quant_config)
+    assert calls["order"][-2:] == [("clean", (16, 2048, 1, 0)), ("dispatch", 1)]
+    instance.buffer = Buffer()
+    instance.prepare_async(hidden, topk_weights, topk_ids, 1, None, False, quant_config)
+    assert calls["order"][-2:] == [("clean", (16, 2048, 1, 0)), ("dispatch", 1)]
+
+    # Upstream's dynamic HT/LL policy stays authoritative even when a cached
+    # clean layout is present; an HT dispatch may have dirtied its counters.
+    instance._vllm_hcu_clean_low_latency_buffer = True
+    calls["order"].clear()
+    for _ in range(2):
+        instance.prepare_async(hidden, topk_weights, topk_ids, 1, None, False, quant_config)
+    assert calls["order"] == [
+        ("clean", (16, 2048, 1, 0)), ("dispatch", 1),
+        ("clean", (16, 2048, 1, 0)), ("dispatch", 1),
+    ]
+
     fp8_instance = cls(None, 8, 1, use_fp8_dispatch=True)
     fp8_instance.use_int8_dispatch = False
     fp8_values = torch.ones((1, 2, 4), dtype=torch.float8_e4m3fn)
@@ -5208,3 +5287,62 @@ def test_importing_adapters_does_not_eager_import_optional_moe_stacks():
         importlib.reload(adapter)
     for name in optional:
         assert sys.modules.get(name) is before[name]
+
+
+@pytest.mark.parametrize(
+    ("dp_size", "is_sp", "pcp_size", "backend", "use_ep", "expected"),
+    [
+        # Upstream contract: DP>1 with EP unlocks all2all kernels.
+        (2, False, 1, "allgather_reducescatter", True, True),
+        # Upstream contract: SP-MoE with EP unlocks all2all kernels.
+        (1, True, 1, "allgather_reducescatter", True, True),
+        # HCU PCP+EP+DeepEP-HT: must unlock all2all kernels so the MoE oracle
+        # routes through DeepEPHTPrepareAndFinalize instead of falling back to
+        # ``get_pcp_group().all_gather``/``reduce_scatter``.
+        (1, False, 8, "deepep_high_throughput", True, True),
+        # HCU PCP+EP+DeepEP-LL: same reasoning as HT.
+        (1, False, 8, "deepep_low_latency", True, True),
+        # HCU PCP+EP+DeepEP-Auto: sidecar picks HT/LL, both need the modular
+        # path.
+        (1, False, 8, "deepep_auto", True, True),
+        # PCP+EP with ``allgather_reducescatter``: intentionally still False.
+        # ``AgRsAll2AllManager.dispatch`` asserts ``dp_metadata is not None``
+        # and pulls sizes off ``get_dp_group()``.  DP=1 has no such metadata
+        # and cannot supply per-rank chunk sizes, so activating this path
+        # would only trade a silent fallback for a runtime AssertionError.
+        (1, False, 8, "allgather_reducescatter", True, False),
+        # PCP>1 without EP: no MoE partitioning across ranks in the first
+        # place, all2all path is meaningless.
+        (1, False, 8, "deepep_high_throughput", False, False),
+        # Single-node all-in-one: nothing to dispatch.
+        (1, False, 1, "deepep_high_throughput", True, False),
+    ],
+)
+def test_use_all2all_kernels_gates_pcp_ep_deepep(
+    dp_size: int,
+    is_sp: bool,
+    pcp_size: int,
+    backend: str,
+    use_ep: bool,
+    expected: bool,
+) -> None:
+    """HCU ``use_all2all_kernels`` must mirror the base_pcp_ep communicator gate.
+
+    ``base_pcp_ep`` widens the low-level ``use_all2all`` flag so
+    ``CudaCommunicator`` constructs a ``DeepEPHTAll2AllManager`` under
+    PCP+EP+DeepEP.  ``use_all2all_kernels`` must widen in lockstep — otherwise
+    the DeepEP manager is built but ``maybe_make_prepare_finalize`` returns
+    ``no_dp_ep`` and the MoE runner's PCP fallback issues plain RCCL
+    all_gather/reduce_scatter on the PCP group, leaving the DeepEP buffer
+    idle.  This is the exact half-patched state the fix undoes.
+    """
+    from vllm_hcu.model_executor.layers.fused_moe import config_runtime
+
+    parallel_config = SimpleNamespace(
+        dp_size=dp_size,
+        is_sequence_parallel=is_sp,
+        pcp_size=pcp_size,
+        all2all_backend=backend,
+        use_ep=use_ep,
+    )
+    assert config_runtime.use_all2all_kernels(parallel_config) is expected

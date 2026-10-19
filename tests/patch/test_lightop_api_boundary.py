@@ -37,6 +37,8 @@ ALLOWED_TOP_LEVEL = {
     (CLAMP_OWNER, "fuse_silu_mul_clamp_quant"),
     (CLAMP_OWNER, "fuse_silu_mul_clamp_quant_ep"),
 }
+RAW_LIGHTOP_GATHER_OWNER = "vllm_hcu/models/hy_v4/fp8_kv_dequant.py"
+RAW_LIGHTOP_GATHER_SYMBOL = "decode_gather_and_up_convert_with_indices"
 
 
 def _attribute_parts(node: ast.Attribute) -> tuple[ast.expr, list[str]]:
@@ -156,7 +158,17 @@ class _LightOpVisitor(ast.NodeVisitor):
         elif module.startswith("lightop."):
             suffix = module.removeprefix("lightop.")
             if suffix in {"op", "gemmopt"}:
-                self._violate(node, f"obsolete LightOp namespace {module!r}")
+                exact_gather_import = (
+                    module == "lightop.op"
+                    and self.relative_path == RAW_LIGHTOP_GATHER_OWNER
+                    and len(node.names) == 1
+                    and node.names[0].name == RAW_LIGHTOP_GATHER_SYMBOL
+                    and node.names[0].asname is None
+                )
+                if not exact_gather_import:
+                    self._violate(
+                        node, f"obsolete LightOp namespace {module!r}"
+                    )
             elif suffix not in PUBLIC_CATEGORIES:
                 self._violate(node, f"non-public LightOp module {module!r}")
             else:
@@ -544,6 +556,50 @@ def test_production_uses_public_lightop_categories_only() -> None:
     assert violations == []
 
 
+def test_scanner_allows_exact_hyv4_lightop_gather_import() -> None:
+    visitor = _LightOpVisitor(
+        "vllm_hcu/models/hy_v4/fp8_kv_dequant.py"
+    )
+    visitor.visit(
+        ast.parse(
+            "from lightop.op import "
+            "decode_gather_and_up_convert_with_indices\n"
+        )
+    )
+
+    assert visitor.violations == []
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "source"),
+    [
+        (
+            "vllm_hcu/models/hy_v4/other.py",
+            "from lightop.op import decode_gather_and_up_convert_with_indices\n",
+        ),
+        (
+            RAW_LIGHTOP_GATHER_OWNER,
+            "from lightop.op import "
+            "decode_gather_and_up_convert_with_indices as gather\n",
+        ),
+        (
+            RAW_LIGHTOP_GATHER_OWNER,
+            "from lightop.op import "
+            "decode_gather_and_up_convert_with_indices, other\n",
+        ),
+    ],
+)
+def test_scanner_rejects_broader_raw_lightop_gather_imports(
+    relative_path: str,
+    source: str,
+) -> None:
+    visitor = _LightOpVisitor(relative_path)
+    visitor.visit(ast.parse(source))
+
+    assert len(visitor.violations) == 1
+    assert "obsolete LightOp namespace 'lightop.op'" in visitor.violations[0]
+
+
 def _write_mutation_owner(
     tmp_path: Path,
     *,
@@ -743,6 +799,11 @@ def test_scanner_records_literal_category_getattr(tmp_path: Path) -> None:
 def test_installed_category_exports_cover_production_symbols() -> None:
     used = categorized_symbols(REPOSITORY / "vllm_hcu")
     env = dict(os.environ)
+    if env.get("VLLM_HCU_KIMI_HT_SITU_BACKEND") == "triton":
+        # Explicit temporary Kimi backend does not execute native SiTU.
+        # Strict/default LightOp runs must still require this export, and
+        # all other categorized operations remain mandatory in both modes.
+        used.discard(("lightop.activation", "fuse_situ_mul_quant"))
     env["LIGHTOP_REQUIRED_EXPORTS"] = json.dumps(sorted(used))
     env["ROCM_HOME"] = env.get("ROCM_HOME", env.get("ROCM_PATH", "/opt/dtk"))
     result = subprocess.run(

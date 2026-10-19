@@ -78,6 +78,9 @@ def _run_fresh_v0251(code: str) -> subprocess.CompletedProcess[str]:
     env["VLLM_PLUGINS"] = "__disabled__"
     env["VLLM_V0251_SOURCE_ROOT"] = str(TARGET_VLLM_ROOT)
     env["PYTHONPATH"] = os.pathsep.join((str(TARGET_VLLM_ROOT), str(REPO)))
+    env["HF_HUB_OFFLINE"] = "1"
+    env["HF_DATASETS_OFFLINE"] = "1"
+    env["TRANSFORMERS_OFFLINE"] = "1"
     return subprocess.run(
         [sys.executable, "-c", _TARGET_SOURCE_ASSERTION + code],
         check=False,
@@ -425,21 +428,43 @@ def test_engine_args_normalizes_legacy_deep_gemm_backend_on_existing_object(
 def test_real_v0251_engine_args_normalizes_legacy_deep_gemm_backend() -> None:
     result = _run_fresh_v0251(
         r'''
+import json
+import tempfile
+from pathlib import Path
+
 from vllm.engine import arg_utils
 from vllm_hcu.patch.platform.core_fix import patch_engine_args
 
 patch_engine_args.apply_to_module(arg_utils)
 arg_utils.current_platform.device_type = "cpu"
 
+model_dir = tempfile.TemporaryDirectory()
+Path(model_dir.name, "config.json").write_text(json.dumps({
+    "architectures": ["LlamaForCausalLM"],
+    "hidden_size": 16,
+    "intermediate_size": 32,
+    "max_position_embeddings": 128,
+    "model_type": "llama",
+    "num_attention_heads": 2,
+    "num_hidden_layers": 1,
+    "num_key_value_heads": 2,
+    "vocab_size": 32,
+}))
+model_kwargs = {
+    "model": model_dir.name,
+    "tokenizer": model_dir.name,
+    "skip_tokenizer_init": True,
+}
+
 for kwargs in (
     {"moe_backend": "dpsk_deep_gemm"},
     {"kernel_config": {"moe_backend": "dpsk_deep_gemm"}},
 ):
-    args = arg_utils.EngineArgs(**kwargs)
+    args = arg_utils.EngineArgs(**model_kwargs, **kwargs)
     assert args.moe_backend == "deep_gemm" or args.kernel_config.moe_backend == "deep_gemm"
     assert args.create_engine_config().kernel_config.moe_backend == "deep_gemm"
 
-args = arg_utils.EngineArgs()
+args = arg_utils.EngineArgs(**model_kwargs)
 args.moe_backend = "dpsk_deep_gemm"
 assert args.create_engine_config().kernel_config.moe_backend == "deep_gemm"
 
@@ -626,6 +651,7 @@ def _make_compilation_module() -> ModuleType:
 
     class CompilationConfig:
         def __init__(self) -> None:
+            self.mode = SimpleNamespace(name="VLLM_COMPILE")
             self.pass_config = SimpleNamespace(enable_sp=False)
             self.calls = 0
             self.sp_observed = False
@@ -730,6 +756,17 @@ def test_compilation_adapter_skips_non_piecewise_cudagraphs() -> None:
     assert "vllm::hcu_sparse_attn_indexer" not in config.splitting_ops
 
 
+def test_compilation_adapter_skips_none_mode() -> None:
+    module = _make_compilation_module()
+    patch_compilation_config.apply_to_module(module)
+    config = module.CompilationConfig()
+    config.mode = SimpleNamespace(name="NONE")
+
+    config.set_splitting_ops_for_v1("allgather_reducescatter")
+
+    assert "vllm::hcu_sparse_attn_indexer" not in config.splitting_ops
+
+
 def test_compilation_adapter_requires_finalized_splitting_ops_list() -> None:
     module = _make_compilation_module()
     patch_compilation_config.apply_to_module(module)
@@ -806,6 +843,8 @@ class _FakeModelConfig:
 
 class _FakeCompilationConfig:
     def __init__(self, sizes: list[int] | None = None) -> None:
+        self.mode = None
+        self.pass_config = SimpleNamespace(fuse_act_quant=None)
         self.cudagraph_capture_sizes = sizes
         self.max_cudagraph_capture_size = None
         self.compile_sizes: list[int | str] | None = [
@@ -835,6 +874,10 @@ def _make_vllm_module() -> ModuleType:
             self.compilation_config = _FakeCompilationConfig(sizes)
             self.scheduler_config = SimpleNamespace(max_num_batched_tokens=64)
             self.speculative_config = SimpleNamespace(num_speculative_tokens=3)
+            self.post_init_calls = 0
+
+        def __post_init__(self) -> None:
+            self.post_init_calls += 1
 
         def with_hf_config(
             self,
@@ -878,6 +921,36 @@ def test_vllm_adapter_refreshes_hf_text_config_and_arch_config() -> None:
     updated = config.with_hf_config(_FakeHFConfig("new"))
     assert updated.model_config.hf_text_config.name == "new"
     assert updated.model_config.model_arch_config == "new"
+
+
+def test_kimi_k3_defaults_use_breakable_cudagraph_without_overriding_user(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _make_vllm_module()
+    patch_vllm_config.apply_to_module(module)
+    monkeypatch.delenv("VLLM_USE_BREAKABLE_CUDAGRAPH", raising=False)
+
+    config = module.VllmConfig()
+    config.model_config.architectures = ["KimiK3ForConditionalGeneration"]
+    config.__post_init__()
+
+    assert config.post_init_calls == 1
+    assert os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] == "1"
+    assert config.compilation_config.pass_config.fuse_act_quant is True
+
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "0")
+    explicit_env = module.VllmConfig()
+    explicit_env.model_config.architectures = ["KimiK3ForConditionalGeneration"]
+    explicit_env.__post_init__()
+    assert explicit_env.compilation_config.pass_config.fuse_act_quant is None
+
+    monkeypatch.delenv("VLLM_USE_BREAKABLE_CUDAGRAPH")
+    explicit_mode = module.VllmConfig()
+    explicit_mode.model_config.architectures = ["KimiK3ForConditionalGeneration"]
+    explicit_mode.compilation_config.mode = "user-selected"
+    explicit_mode.__post_init__()
+    assert "VLLM_USE_BREAKABLE_CUDAGRAPH" not in os.environ
+    assert explicit_mode.compilation_config.pass_config.fuse_act_quant is None
 
 
 def test_request_cudagraph_buckets_and_feature_off_equivalence(
@@ -1221,6 +1294,7 @@ def test_slimquant_uses_public_registry_without_loading_concrete_kernels(
         "slimquant_marlin",
         "slimquant_compressed_tensors_marlin",
         "slimquant_w4a8",
+        "kimi_k3_w4a8",
     ]
     assert not patch_slimquant_registry.apply_to_module(module)
 
@@ -1588,6 +1662,243 @@ def test_varlen_flash_attention_uses_64_token_cache_blocks(
     HCUPlatform.check_and_update_config(config)
 
     assert config.cache_config.block_size == 64
+
+
+def _check_hyv4_dcp_cudagraph_policy(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    architecture: str = "HYV4ForCausalLM",
+    dcp_backend: str = "ag_rs",
+    pcp_size: int = 1,
+    breakable_cudagraph: bool = False,
+    cudagraph_mode: Any,
+    compilation_mode: Any,
+) -> Any:
+    import vllm.envs as vllm_envs
+    from vllm.config.compilation import CompilationConfig
+    from vllm_hcu.patch.platform.framework_opt import (
+        patch_multiproc_executor,
+        patch_scheduler,
+    )
+    from vllm_hcu.platforms.hcu import HCUPlatform
+
+    monkeypatch.setattr(
+        patch_vllm_config,
+        "validate_and_update_hcu_config",
+        lambda config: HcuFeatureConfig(),
+    )
+    monkeypatch.setattr(
+        patch_scheduler,
+        "select_hcu_scheduler",
+        lambda config: False,
+    )
+    monkeypatch.setattr(
+        patch_multiproc_executor,
+        "select_hcu_multiproc_executor",
+        lambda config: False,
+    )
+    monkeypatch.setattr(
+        vllm_envs,
+        "VLLM_USE_BREAKABLE_CUDAGRAPH",
+        breakable_cudagraph,
+    )
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            architectures=[architecture],
+            use_mla=True,
+        ),
+        cache_config=None,
+        compilation_config=CompilationConfig(
+            cudagraph_mode=cudagraph_mode,
+            mode=compilation_mode,
+            splitting_ops=[],
+        ),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=2,
+            prefill_context_parallel_size=pcp_size,
+            dcp_comm_backend=dcp_backend,
+            worker_cls="custom.Worker",
+        ),
+    )
+
+    HCUPlatform.check_and_update_config(config)
+    return config.compilation_config
+
+
+@pytest.mark.parametrize("dcp_backend", ["ag_rs", "a2a"])
+def test_hyv4_dcp_preserves_requested_full_cudagraph_for_supported_backends(
+    monkeypatch: pytest.MonkeyPatch,
+    dcp_backend: str,
+) -> None:
+    from vllm.config.compilation import CUDAGraphMode, CompilationMode
+    from vllm.v1.attention.backend import AttentionCGSupport
+
+    compilation_config = _check_hyv4_dcp_cudagraph_policy(
+        monkeypatch,
+        dcp_backend=dcp_backend,
+        cudagraph_mode=CUDAGraphMode.FULL,
+        compilation_mode=CompilationMode.NONE,
+    )
+
+    assert compilation_config.cudagraph_mode is CUDAGraphMode.FULL
+    resolved_mode = compilation_config.resolve_cudagraph_mode_and_sizes(
+        AttentionCGSupport.UNIFORM_BATCH,
+        "DeepseekV32IndexerBackend",
+    )
+    assert resolved_mode is CUDAGraphMode.FULL_DECODE_ONLY
+
+
+@pytest.mark.parametrize(
+    ("architecture", "dcp_backend", "pcp_size", "use_compilation"),
+    [
+        ("Qwen3ForCausalLM", "ag_rs", 1, False),
+        ("HYV4ForCausalLM", "unsupported", 1, False),
+        ("HYV4ForCausalLM", "ag_rs", 2, False),
+        ("HYV4ForCausalLM", "ag_rs", 1, True),
+    ],
+)
+def test_unvalidated_dcp_full_cudagraph_combinations_still_use_piecewise(
+    monkeypatch: pytest.MonkeyPatch,
+    architecture: str,
+    dcp_backend: str,
+    pcp_size: int,
+    use_compilation: bool,
+) -> None:
+    from vllm.config.compilation import CUDAGraphMode, CompilationMode
+
+    compilation_mode = (
+        CompilationMode.VLLM_COMPILE if use_compilation else CompilationMode.NONE
+    )
+    compilation_config = _check_hyv4_dcp_cudagraph_policy(
+        monkeypatch,
+        architecture=architecture,
+        dcp_backend=dcp_backend,
+        pcp_size=pcp_size,
+        cudagraph_mode=CUDAGraphMode.FULL,
+        compilation_mode=compilation_mode,
+    )
+
+    assert compilation_config.cudagraph_mode is CUDAGraphMode.PIECEWISE
+
+
+@pytest.mark.parametrize("dcp_backend", ["ag_rs", "a2a"])
+def test_hyv4_dcp_preserves_default_combined_graph_mode_with_mtp3(
+    monkeypatch: pytest.MonkeyPatch,
+    dcp_backend: str,
+) -> None:
+    from vllm.config.compilation import CUDAGraphMode, CompilationMode
+    from vllm.v1.attention.backend import AttentionCGSupport
+
+    compilation_config = _check_hyv4_dcp_cudagraph_policy(
+        monkeypatch,
+        dcp_backend=dcp_backend,
+        breakable_cudagraph=True,
+        cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+        compilation_mode=CompilationMode.NONE,
+    )
+
+    assert (
+        compilation_config.cudagraph_mode
+        is CUDAGraphMode.FULL_AND_PIECEWISE
+    )
+    resolved_mode = compilation_config.resolve_cudagraph_mode_and_sizes(
+        AttentionCGSupport.UNIFORM_BATCH,
+        "DeepseekV32IndexerBackend",
+        uniform_decode_query_len=4,
+        use_v2_model_runner=True,
+    )
+    assert resolved_mode is CUDAGraphMode.FULL_AND_PIECEWISE
+
+
+def test_hyv4_dcp_rejects_combined_graph_mode_without_breakable_or_compilation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.config.compilation import CUDAGraphMode, CompilationMode
+
+    compilation_config = _check_hyv4_dcp_cudagraph_policy(
+        monkeypatch,
+        cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+        compilation_mode=CompilationMode.NONE,
+    )
+
+    assert compilation_config.cudagraph_mode is CUDAGraphMode.PIECEWISE
+
+
+def test_hyv4_dcp_rejects_unvalidated_compiled_combined_graph_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.config.compilation import CUDAGraphMode, CompilationMode
+
+    compilation_config = _check_hyv4_dcp_cudagraph_policy(
+        monkeypatch,
+        cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+        compilation_mode=CompilationMode.VLLM_COMPILE,
+    )
+
+    assert compilation_config.cudagraph_mode is CUDAGraphMode.PIECEWISE
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_mla_backend_priority_matches_v0251(
+    monkeypatch: pytest.MonkeyPatch, enabled: bool,
+) -> None:
+    from vllm_hcu.platforms import envs as hcu_envs
+    from vllm_hcu.platforms.hcu import _get_backend_priorities
+
+    monkeypatch.setattr(hcu_envs, "VLLM_HCU_USE_FLASHMLA", enabled)
+    _get_backend_priorities.cache_clear()
+    try:
+        names = [backend.name for backend in _get_backend_priorities(True, False)]
+        assert names == ["FLASHMLA", "TRITON_MLA"]
+    finally:
+        _get_backend_priorities.cache_clear()
+
+
+def test_hcu_collective_switch_and_source_decode_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_hcu.model_executor.layers.fused_moe import shared_experts
+    from vllm_hcu.platforms import envs as hcu_envs
+    from vllm_hcu.platforms.hcu import HCUPlatform
+
+    monkeypatch.delenv("VLLM_HCU_USE_CUSTOM_ALLREDUCE", raising=False)
+    assert HCUPlatform.use_custom_allreduce() is True
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_ALLREDUCE", "0")
+    assert HCUPlatform.use_custom_allreduce() is False
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_ALLREDUCE", "1")
+    assert HCUPlatform.use_custom_allreduce() is True
+
+    from vllm.platforms.interface import Platform
+
+    other_config = SimpleNamespace(
+        model_config=SimpleNamespace(architectures=["Qwen3ForCausalLM"])
+    )
+    assert HCUPlatform.get_default_ir_op_priority(other_config) == (
+        Platform.get_default_ir_op_priority(other_config)
+    )
+    priority = HCUPlatform.get_default_ir_op_priority(SimpleNamespace(
+        model_config=SimpleNamespace(architectures=["KimiK3ForConditionalGeneration"])
+    ))
+    assert priority.rms_norm == ["vllm_c", "native"]
+    assert priority.fused_add_rms_norm == ["vllm_c", "native"]
+
+    runner = object.__new__(shared_experts.SharedExperts)
+    runner._stream = object()
+    hidden_states = SimpleNamespace(shape=(1,))
+    monkeypatch.setattr(shared_experts.current_platform, "is_cuda", lambda: False)
+    monkeypatch.setattr(
+        shared_experts.current_platform, "is_cuda_alike", lambda: True
+    )
+    monkeypatch.setattr(hcu_envs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setattr(hcu_envs, "VLLM_HCU_SHARED_EXPERTS_STREAM_FORCE", False)
+    monkeypatch.setattr(hcu_envs, "VLLM_HCU_SHARED_EXPERTS_EARLY_LAUNCH", False)
+    monkeypatch.setattr(
+        shared_experts.envs, "VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD", 1
+    )
+
+    assert runner._should_run_shared_in_aux_stream(hidden_states) is False
+    monkeypatch.setattr(hcu_envs, "VLLM_HCU_SHARED_EXPERTS_STREAM_FORCE", True)
+    assert runner._should_run_shared_in_aux_stream(hidden_states) is True
 
 
 @pytest.mark.parametrize(

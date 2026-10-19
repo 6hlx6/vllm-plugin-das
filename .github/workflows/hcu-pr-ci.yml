@@ -25,7 +25,8 @@ jobs:
     name: Static gate and test selection
     runs-on:
       - self-hosted
-      - hcu-ci-pr
+      - ci
+      - bw1100
     defaults:
       run:
         shell: bash
@@ -35,6 +36,7 @@ jobs:
       groups: ${{ steps.select.outputs.groups }}
       docs_only: ${{ steps.select.outputs.docs_only }}
       fallback: ${{ steps.select.outputs.fallback }}
+      tested_ref: ${{ steps.tested-ref.outputs.sha }}
     steps:
       - name: Repair self-hosted workspace before checkout
         run: |
@@ -90,6 +92,10 @@ jobs:
           clean: true
           fetch-depth: 0
 
+      - name: Record tested revision
+        id: tested-ref
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
       - name: Fetch PR diff endpoints
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -126,7 +132,7 @@ jobs:
             python3.10 .github/scripts/hcu_ci/build_hcu_matrix.py --profile nightly >/dev/null
             python3.10 .github/scripts/hcu_ci/build_hcu_matrix.py --profile quarantine >/dev/null
             source /opt/dtk/env.sh
-            python3.10 tools/run_patch_tests.py --suite contract -- -o cache_dir=/tmp/hcu-ci-pytest-cache
+            python3.10 tools/run_patch_tests.py --suite contract -- -o cache_dir="$XDG_CACHE_HOME/pytest"
           '
 
       - name: Select HCU matrix
@@ -159,7 +165,8 @@ jobs:
     needs: static-and-select
     runs-on:
       - self-hosted
-      - hcu-ci-pr
+      - ci
+      - bw1100
     defaults:
       run:
         shell: bash
@@ -256,7 +263,7 @@ jobs:
     uses: ./.github/workflows/_selected-hcu-tests.yml
     with:
       matrix: ${{ needs.static-and-select.outputs.matrix }}
-      tested_ref: ${{ github.event.pull_request.merge_commit_sha }}
+      tested_ref: ${{ needs.static-and-select.outputs.tested_ref }}
     permissions:
       contents: read
 
@@ -269,7 +276,8 @@ jobs:
       - selected-hcu-tests
     runs-on:
       - self-hosted
-      - hcu-ci-pr
+      - ci
+      - bw1100
     env:
       STATIC_RESULT: ${{ needs.static-and-select.result }}
       AUTH_RESULT: ${{ needs.authorize-hcu.result }}

@@ -19,6 +19,44 @@ from vllm.v1.attention.backends.utils import get_kv_cache_layout
 
 import vllm_hcu.hcu_ops as hcu_ops
 
+_DSPARK_MAX_CAPTURE_TOKENS = 512
+_DSPARK_MAX_CONTEXT_LENGTH = 4096
+_DSPARK_MAX_STATIC_KV_SCRATCH_BYTES = 584 * 1024**2
+
+
+@functools.lru_cache(maxsize=None)
+def _dspark_paged_attention_uses_extended_abi(
+    paged_attention: Callable[..., Any],
+) -> bool:
+    """Identify the two supported DSpark paged-attention ABIs."""
+    try:
+        signature = inspect.signature(paged_attention)
+    except (TypeError, ValueError):
+        signature = None
+    if signature is not None:
+        positional_count = sum(
+            parameter.kind
+            in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            )
+            for parameter in signature.parameters.values()
+        )
+        if positional_count in (15, 18):
+            return positional_count == 18
+
+    signature_line = (getattr(paged_attention, "__doc__", "") or "").split(
+        "\n", 1
+    )[0]
+    if "arg17:" in signature_line:
+        return True
+    if "arg14:" in signature_line and "arg15:" not in signature_line:
+        return False
+    raise RuntimeError(
+        "Unsupported flash_attn paged_attention ABI; expected 15 or 18 "
+        "positional parameters"
+    )
+
 
 def _flash_attn_layout() -> str:
     cache_layout = get_kv_cache_layout()
@@ -66,8 +104,264 @@ def _with_kv_cache_layout(function: Callable[..., Any], name: str):
     return wrapped
 
 
+def _matches_dspark_attention_shape(
+    kwargs: dict[str, Any],
+    *,
+    query_len: int,
+    causal: bool,
+) -> bool:
+    """Match a DSpark-7 attention shape with capture-safe static metadata."""
+    q = kwargs.get("q")
+    k = kwargs.get("k")
+    v = kwargs.get("v")
+    out = kwargs.get("out")
+    cu_seqlens_q = kwargs.get("cu_seqlens_q")
+    seqused_k = kwargs.get("seqused_k")
+    block_table = kwargs.get("block_table")
+    window_size = kwargs.get("window_size", (-1, -1))
+
+    if not all(isinstance(tensor, Tensor) for tensor in (q, k, v, out)):
+        return False
+    if not all(
+        isinstance(tensor, Tensor)
+        for tensor in (cu_seqlens_q, seqused_k, block_table)
+    ):
+        return False
+    if q.ndim != 3 or k.ndim != 4 or v.shape != k.shape:
+        return False
+    if out.shape != q.shape:
+        return False
+    tensors = (q, k, v, out, cu_seqlens_q, seqused_k, block_table)
+    if any(tensor.device != q.device for tensor in tensors):
+        return False
+    contiguous_tensors = (q, out, cu_seqlens_q, seqused_k, block_table)
+    if any(not tensor.is_contiguous() for tensor in contiguous_tensors):
+        return False
+    if kwargs.get("layout") != "bshd":
+        return False
+    if kwargs.get("max_seqlen_q") != query_len:
+        return False
+    if cu_seqlens_q.ndim != 1:
+        return False
+    batch_size = cu_seqlens_q.shape[0] - 1
+    if batch_size <= 0 or q.shape[0] != batch_size * query_len:
+        return False
+    if block_table.ndim != 2 or block_table.shape[0] != batch_size:
+        return False
+    if seqused_k.ndim != 1 or seqused_k.shape[0] != batch_size:
+        return False
+    if any(
+        tensor.dtype != torch.int32
+        for tensor in (cu_seqlens_q, seqused_k, block_table)
+    ):
+        return False
+    if k.shape[1] != 64 or q.shape[-1] != 128 or v.shape[-1] != 128:
+        return False
+    expected_inner_strides = (k.shape[-2] * k.shape[-1], k.shape[-1], 1)
+    if k.stride()[1:] != expected_inner_strides:
+        return False
+    if v.stride()[1:] != expected_inner_strides:
+        return False
+    if min(k.stride(0), v.stride(0)) < 64 * expected_inner_strides[0]:
+        return False
+    if k.shape[-2] <= 0 or q.shape[-2] % k.shape[-2] != 0:
+        return False
+    # The vendor paged-attention kernel flattens the query-token and query-head
+    # axes and accepts at most 64 such heads per KV head.  The qlen=7 route
+    # below uses varlen_fwd instead and does not have this restriction.
+    if causal and q.shape[-2] * query_len > k.shape[-2] * 64:
+        return False
+    max_seqlen_k = kwargs.get("max_seqlen_k")
+    if (
+        not isinstance(max_seqlen_k, int)
+        or max_seqlen_k <= 0
+        or max_seqlen_k > _DSPARK_MAX_CONTEXT_LENGTH
+    ):
+        return False
+    if q.shape[0] > _DSPARK_MAX_CAPTURE_TOKENS:
+        return False
+    if block_table.shape[1] * 64 < max_seqlen_k:
+        return False
+    if any(tensor.dtype != torch.bfloat16 for tensor in (q, k, v, out)):
+        return False
+    if not causal:
+        scratch_bytes = (
+            2
+            * batch_size
+            * max_seqlen_k
+            * k.shape[-2]
+            * k.shape[-1]
+            * k.element_size()
+        )
+        if scratch_bytes > _DSPARK_MAX_STATIC_KV_SCRATCH_BYTES:
+            return False
+    if bool(kwargs.get("causal", False)) is not causal:
+        return False
+    if window_size is not None:
+        if not isinstance(window_size, (list, tuple)):
+            return False
+        if len(window_size) != 2 or tuple(window_size) != (-1, -1):
+            return False
+    if kwargs.get("dropout_p", 0.0) != 0.0:
+        return False
+    if kwargs.get("softcap", 0.0) != 0.0:
+        return False
+    if kwargs.get("alibi_slopes") is not None or kwargs.get("s_aux") is not None:
+        return False
+    if kwargs.get("q_v") is not None:
+        return False
+    if kwargs.get("return_attn_probs", False):
+        return False
+    if kwargs.get("return_softmax_lse", False):
+        return False
+    if kwargs.get("cu_seqlens_k") is not None:
+        return False
+    if kwargs.get("deterministic", False):
+        return False
+    if kwargs.get("scheduler_metadata") is not None:
+        return False
+    if kwargs.get("num_splits", 0) != 0:
+        return False
+    if kwargs.get("cp_world_size", 1) != 1:
+        return False
+    if kwargs.get("cp_rank", 0) != 0 or kwargs.get("cp_tot_seqused_k") is not None:
+        return False
+    for name in ("q_descale", "k_descale", "v_descale"):
+        scale = kwargs.get(name)
+        if scale is not None and (
+            not isinstance(scale, Tensor)
+            or scale.device != q.device
+            or scale.dtype != torch.float32
+            or scale.shape != (batch_size, k.shape[-2])
+        ):
+            return False
+    return True
+
+
+@functools.wraps(_flash_attn_varlen_func)
+def _flash_attn_varlen_func_with_dspark_capture(
+    *args: Any,
+    **kwargs: Any,
+):
+    if args:
+        return _flash_attn_varlen_func(*args, **kwargs)
+
+    use_paged_attention = _matches_dspark_attention_shape(
+        kwargs,
+        query_len=8,
+        causal=True,
+    )
+    use_drafter_varlen = _matches_dspark_attention_shape(
+        kwargs,
+        query_len=7,
+        causal=False,
+    )
+    if not use_paged_attention and not use_drafter_varlen:
+        return _flash_attn_varlen_func(**kwargs)
+
+    from flash_attn.flash_attn_interface import flash_attn_cuda
+
+    q = kwargs["q"]
+    k = kwargs["k"]
+    v = kwargs["v"]
+    out = kwargs["out"]
+    cu_seqlens_q = kwargs["cu_seqlens_q"]
+    batch_size = cu_seqlens_q.shape[0] - 1
+    softmax_scale = kwargs.get("softmax_scale")
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** -0.5
+    if use_drafter_varlen:
+        # DSpark's non-causal draft block cannot use paged_attention, which
+        # applies a causal mask. Eager execution can size the gather buffers to
+        # the used KV tokens; graph capture uses a static upper bound instead
+        # of materializing seqused_k.sum() on the host. The matcher bounds the
+        # captured scratch space to 584 MiB per rank, matching Qwen3-8B TP2 at
+        # its maximum admitted shape:
+        # 2 * floor(512 / 7) * 4096 * 4 * 128 * sizeof(bfloat16).
+        max_seqlen_k = kwargs["max_seqlen_k"]
+        if torch.cuda.is_current_stream_capturing():
+            total_k = batch_size * max_seqlen_k
+        else:
+            total_k = int(kwargs["seqused_k"].sum().item())
+        contiguous_k = torch.empty(
+            (total_k, k.shape[-2], k.shape[-1]),
+            device=k.device,
+            dtype=k.dtype,
+        )
+        contiguous_v = torch.empty_like(contiguous_k)
+        cu_seqlens_k = torch.empty_like(cu_seqlens_q)
+        flash_attn_cuda.pagedkv_to_contiguouskv(
+            contiguous_k,
+            contiguous_v,
+            k,
+            v,
+            kwargs["block_table"],
+            kwargs["seqused_k"],
+            cu_seqlens_k,
+            max_seqlen_k,
+            2,
+        )
+        flash_attn_cuda.varlen_fwd(
+            q,
+            contiguous_k,
+            contiguous_v,
+            out,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            None,
+            None,
+            None,
+            None,
+            7,
+            max_seqlen_k,
+            0.0,
+            softmax_scale,
+            False,
+            False,
+            -1,
+            -1,
+            0.0,
+            False,
+            kwargs.get("q_descale"),
+            kwargs.get("k_descale"),
+            kwargs.get("v_descale"),
+            None,
+            None,
+        )
+        return out
+
+    paged_attention_args = (
+        out,
+        q.reshape(batch_size, 8, q.shape[-2], q.shape[-1]),
+        k,
+        v,
+        softmax_scale,
+        kwargs["block_table"],
+        kwargs["seqused_k"],
+        None,
+        "",
+        kwargs.get("q_descale"),
+        kwargs.get("k_descale"),
+        kwargs.get("v_descale"),
+        kwargs["max_seqlen_k"],
+        None,
+        2,
+    )
+    paged_attention = flash_attn_cuda.paged_attention
+    if _dspark_paged_attention_uses_extended_abi(paged_attention):
+        window_size = kwargs.get("window_size") or (-1, -1)
+        paged_attention(
+            *paged_attention_args,
+            *window_size,
+            kwargs["causal"],
+        )
+    else:
+        paged_attention(*paged_attention_args)
+    return out
+
+
 flash_attn_varlen_func = _with_kv_cache_layout(
-    _flash_attn_varlen_func,
+    _flash_attn_varlen_func_with_dspark_capture,
     "flash_attn_varlen_func",
 )
 hg_flash_attn_varlen_func = _with_kv_cache_layout(

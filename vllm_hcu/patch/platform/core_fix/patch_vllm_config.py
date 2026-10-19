@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import functools
 import inspect
+import os
 from types import ModuleType
 from typing import Any
 
@@ -18,6 +19,7 @@ from .patch_compilation_config import bind_hcu_config
 TARGET_MODULE = "vllm.config.vllm"
 PATCH_ID = "platform.core_fix.hcu_config.vllm"
 TARGETS = (
+    f"{TARGET_MODULE}.VllmConfig.__post_init__",
     f"{TARGET_MODULE}.VllmConfig.with_hf_config",
     f"{TARGET_MODULE}.VllmConfig._set_cudagraph_sizes",
     f"{TARGET_MODULE}.VllmConfig._get_v2_model_runner_unsupported_features",
@@ -34,6 +36,41 @@ _REQUEST_CAPTURE_SIZES = (
 )
 
 
+def _uses_kimi_k3(vllm_config: object) -> bool:
+    model_config = getattr(vllm_config, "model_config", None)
+    architectures = getattr(model_config, "architectures", ())
+    return any(
+        isinstance(architecture, str) and architecture.startswith("KimiK3")
+        for architecture in architectures
+    )
+
+
+def _apply_kimi_k3_source_compilation_defaults(vllm_config: object) -> None:
+    """Align the implicit Kimi-K3 compilation path with the source runtime."""
+
+    if not _uses_kimi_k3(vllm_config):
+        return
+    compilation_config = getattr(vllm_config, "compilation_config", None)
+    if compilation_config is None:
+        raise PatchCompatibilityError("VllmConfig.compilation_config is missing")
+
+    # An explicit mode or breakable-graph setting remains authoritative.
+    if (
+        getattr(compilation_config, "mode", None) is not None
+        or "VLLM_USE_BREAKABLE_CUDAGRAPH" in os.environ
+    ):
+        return
+
+    os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] = "1"
+    pass_config = getattr(compilation_config, "pass_config", None)
+    if pass_config is None or not hasattr(pass_config, "fuse_act_quant"):
+        raise PatchCompatibilityError(
+            "CompilationConfig.pass_config.fuse_act_quant is missing"
+        )
+    if pass_config.fuse_act_quant is None:
+        pass_config.fuse_act_quant = True
+
+
 def _require_hcu_pcp_attribute(owner: object, name: str, owner_name: str) -> Any:
     try:
         return getattr(owner, name)
@@ -41,6 +78,62 @@ def _require_hcu_pcp_attribute(owner: object, name: str, owner_name: str) -> Any
         raise PatchCompatibilityError(
             f"HCU PCP requires {owner_name}.{name} in vLLM 0.25.1"
         ) from exc
+
+
+def _require_hyv4_pcp_mtp_contract(vllm_config: object) -> None:
+    """Admit checkpoint-native replicated MTP with any token depth."""
+    parallel = vllm_config.parallel_config
+    speculative = vllm_config.speculative_config
+    if speculative.method != "mtp":
+        raise ValueError(
+            "HYV4 PCP speculative decoding requires checkpoint-native MTP."
+        )
+    # The caller already checks topology, eager, MRV2 and the 41,37 partition.
+    # Draft construction must retain the target checkpoint and its single
+    # native layer; a registered draft architecture alone is insufficient.
+    target = vllm_config.model_config
+    draft = getattr(speculative, "draft_model_config", None)
+    if draft is None:
+        raise ValueError(
+            "HYV4 PCP speculative decoding requires a native MTP draft model config."
+        )
+    target_hf = _require_hcu_pcp_attribute(target, "hf_config", "ModelConfig")
+    draft_hf = _require_hcu_pcp_attribute(draft, "hf_config", "ModelConfig")
+    if (
+        _require_hcu_pcp_attribute(draft, "architectures", "ModelConfig")
+        != ["HYV4MTPModel"]
+        or _require_hcu_pcp_attribute(draft, "model", "ModelConfig")
+        != _require_hcu_pcp_attribute(target, "model", "ModelConfig")
+        or getattr(target_hf, "num_nextn_predict_layers", None) != 1
+        or getattr(draft_hf, "num_nextn_predict_layers", None) != 1
+        or getattr(draft_hf, "n_predict", None) != 1
+    ):
+        raise ValueError(
+            "HYV4 PCP MTP requires exactly one checkpoint-native draft layer."
+        )
+    kernel = _require_hcu_pcp_attribute(vllm_config, "kernel_config", "VllmConfig")
+    if (
+        _require_hcu_pcp_attribute(parallel, "all2all_backend", "ParallelConfig")
+        != "deepep_high_throughput"
+        or _require_hcu_pcp_attribute(kernel, "moe_backend", "KernelConfig")
+        != "deep_gemm"
+        # Sparse MLA canonicalizes the E4M3 alias during native draft loading.
+        # PCP-manager initialization revalidates that same resolved config.
+        or _require_hcu_pcp_attribute(
+            vllm_config.cache_config, "cache_dtype", "CacheConfig"
+        ) not in ("fp8_e4m3", "fp8_ds_mla")
+    ):
+        raise ValueError(
+            "HYV4 PCP MTP requires DeepEP HT, DeepGEMM and FP8 E4M3 KV."
+        )
+    feature_cfg = get_hcu_config(vllm_config)
+    if (
+        _require_hcu_pcp_attribute(parallel, "enable_eplb", "ParallelConfig")
+        or feature_cfg.expert_map_path
+        or feature_cfg.expert_map_record_path
+        or feature_cfg.eplb_disable_rearrange
+    ):
+        raise ValueError("HYV4 PCP MTP does not support EPLB.")
 
 
 def _require_mrv2_pcp_contract(vllm_config: object) -> None:
@@ -68,13 +161,19 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
         _require_hcu_pcp_attribute(model_config, "use_mla", "ModelConfig")
     )
     is_glm52 = architectures == ["GlmMoeDsaForCausalLM"]
-    if use_mla and not is_glm52:
+    is_hyv4 = architectures == ["HYV4ForCausalLM"]
+    if "HYV4MTPModel" in architectures:
+        raise ValueError("HYV4 PCP does not support HYV4MTPModel.")
+    if "HYV4ForCausalLM" in architectures and not is_hyv4:
+        raise ValueError("HYV4 PCP requires exactly architecture HYV4ForCausalLM.")
+    if use_mla and not (is_glm52 or is_hyv4):
         raise ValueError(
-            "GLM-5.2 PCP only supports architecture "
-            "GlmMoeDsaForCausalLM."
+            "HCU MLA PCP only supports GLM-5.2 architecture "
+            "GlmMoeDsaForCausalLM or HYV4ForCausalLM."
         )
-    if is_glm52 and not use_mla:
-        raise ValueError("GLM-5.2 PCP requires MLA or sparse MLA.")
+    mla_model = "HYV4" if is_hyv4 else "GLM-5.2"
+    if (is_glm52 or is_hyv4) and not use_mla:
+        raise ValueError(f"{mla_model} PCP requires MLA or sparse MLA.")
     if not use_mla:
         from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
@@ -94,17 +193,50 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
         raise ValueError(
             "FlashAttention PCP does not support hybrid KV cache groups."
         )
-    if _require_hcu_pcp_attribute(
+    pp_size = _require_hcu_pcp_attribute(
         parallel_config, "pipeline_parallel_size", "ParallelConfig"
-    ) != 1:
-        raise ValueError("HCU PCP does not support pipeline parallelism.")
+    )
+    kv_transfer_config = _require_hcu_pcp_attribute(
+        vllm_config, "kv_transfer_config", "VllmConfig"
+    )
+    if is_hyv4 and pp_size != 1 and kv_transfer_config is not None:
+        raise ValueError("HYV4 PP + PCP + P/D disaggregation is not supported.")
+    if pp_size != 1:
+        if not is_hyv4:
+            raise ValueError("HCU PCP does not support pipeline parallelism.")
+        expected = {
+            "pipeline_parallel_size": 2,
+            "tensor_parallel_size": 1,
+            "prefill_context_parallel_size": 4,
+            "data_parallel_size": 1,
+            "decode_context_parallel_size": 1,
+            "enable_expert_parallel": True,
+        }
+        if (
+            any(
+                _require_hcu_pcp_attribute(parallel_config, name, "ParallelConfig")
+                != value
+                for name, value in expected.items()
+            )
+            or not _require_hcu_pcp_attribute(
+                model_config, "enforce_eager", "ModelConfig"
+            )
+            or os.environ.get("VLLM_PP_LAYER_PARTITION") != "41,37"
+        ):
+            raise ValueError(
+                "Hy4 PP2+PCP4 requires PP=2, TP=1, PCP=4, DP=1, DCP=1, "
+                "expert parallelism, eager execution, and "
+                "VLLM_PP_LAYER_PARTITION=41,37."
+            )
     dcp_size = int(
         _require_hcu_pcp_attribute(
             parallel_config, "decode_context_parallel_size", "ParallelConfig"
         )
     )
     if use_mla and dcp_size != 1:
-        raise ValueError("GLM-5.2 PCP does not support decode context parallelism.")
+        raise ValueError(
+            f"{mla_model} PCP does not support decode context parallelism."
+        )
     if not use_mla and dcp_size != 1:
         raise ValueError(
             "FlashAttention PCP does not support decode context parallelism."
@@ -116,33 +248,27 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
     if use_mla and not _require_hcu_pcp_attribute(
         parallel_config, "enable_expert_parallel", "ParallelConfig"
     ):
-        raise ValueError("GLM-5.2 PCP requires expert parallelism.")
+        raise ValueError(f"{mla_model} PCP requires expert parallelism.")
     if use_mla and not _require_hcu_pcp_attribute(
         model_config, "enforce_eager", "ModelConfig"
     ):
-        raise ValueError("GLM-5.2 PCP requires eager execution without graphs.")
+        raise ValueError(f"{mla_model} PCP requires eager execution without graphs.")
     speculative_config = _require_hcu_pcp_attribute(
         vllm_config, "speculative_config", "VllmConfig"
     )
     if speculative_config is not None:
+        if is_hyv4:
+            _require_hyv4_pcp_mtp_contract(vllm_config)
         if not use_mla:
             raise ValueError(
                 "FlashAttention PCP does not support speculative decoding or MTP."
             )
-        method = _require_hcu_pcp_attribute(
-            speculative_config, "method", "SpeculativeConfig"
-        )
-        if method != "mtp":
-            raise ValueError("GLM-5.2 PCP only supports built-in MTP.")
-        num_speculative_tokens = _require_hcu_pcp_attribute(
-            speculative_config,
-            "num_speculative_tokens",
-            "SpeculativeConfig",
-        )
-        if num_speculative_tokens not in (1, 2):
-            raise ValueError(
-                "GLM-5.2 PCP+MTP requires one or two speculative tokens."
+        if not is_hyv4:
+            method = _require_hcu_pcp_attribute(
+                speculative_config, "method", "SpeculativeConfig"
             )
+            if method != "mtp":
+                raise ValueError("GLM-5.2 PCP only supports built-in MTP.")
     if _require_hcu_pcp_attribute(vllm_config, "lora_config", "VllmConfig") is not None:
         raise ValueError("HCU PCP does not support LoRA.")
     if _require_hcu_pcp_attribute(
@@ -154,20 +280,32 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
     ) is not None:
         raise ValueError("HCU PCP does not support KV offload.")
 
-    kv_transfer_config = _require_hcu_pcp_attribute(
-        vllm_config, "kv_transfer_config", "VllmConfig"
-    )
-    if kv_transfer_config is not None and _require_hcu_pcp_attribute(
-        kv_transfer_config, "kv_connector", "KVTransferConfig"
-    ) is not None:
-        raise ValueError("HCU PCP does not support P/D disaggregation.")
+    if kv_transfer_config is not None and (
+        is_hyv4
+        or _require_hcu_pcp_attribute(
+            kv_transfer_config, "kv_connector", "KVTransferConfig"
+        )
+        is not None
+    ):
+        # kv_role is the validated KVTransferConfig role, not kv_rank or a
+        # connector-name heuristic. kv_both includes a consumer and is excluded.
+        if not (
+            is_hyv4
+            and getattr(kv_transfer_config, "kv_connector", None) == "MooncakeConnector"
+            and getattr(kv_transfer_config, "kv_role", None) == "kv_producer"
+            and getattr(kv_transfer_config, "kv_connector_module_path", "") is None
+        ):
+            raise ValueError(
+                "HCU PCP P/D disaggregation requires HYV4 PP1 with the registered "
+                "MooncakeConnector and kv_role='kv_producer'."
+            )
 
     feature_config = get_hcu_config(vllm_config)
     if feature_config.enable_lightly_cp:
         raise ValueError("HCU PCP does not support lightly-CP.")
     if feature_config.enable_multi_layers_mtp:
         if use_mla:
-            raise ValueError("GLM-5.2 PCP does not support HCU multi-layer MTP.")
+            raise ValueError(f"{mla_model} PCP does not support HCU multi-layer MTP.")
         raise ValueError("FlashAttention PCP does not support multi-layer MTP.")
 
 
@@ -377,6 +515,7 @@ def apply_to_module(module: ModuleType) -> bool:
     if getattr(vllm_config, _MARKER, False):
         return False
 
+    post_init = vars(vllm_config).get("__post_init__")
     with_hf_config = vars(vllm_config).get("with_hf_config")
     set_cudagraph_sizes = vars(vllm_config).get("_set_cudagraph_sizes")
     get_v2_unsupported_features = vars(vllm_config).get(
@@ -385,7 +524,8 @@ def apply_to_module(module: ModuleType) -> bool:
     validate_v2_model_runner = vars(vllm_config).get("_validate_v2_model_runner")
     get_model_arch_config = vars(model_config_class).get("get_model_arch_config")
     if (
-        not callable(with_hf_config)
+        not callable(post_init)
+        or not callable(with_hf_config)
         or not callable(set_cudagraph_sizes)
         or not callable(get_v2_unsupported_features)
         or not callable(validate_v2_model_runner)
@@ -394,10 +534,16 @@ def apply_to_module(module: ModuleType) -> bool:
         raise PatchCompatibilityError(
             "required HCU VllmConfig compatibility methods are missing"
         )
+    post_init_signature = inspect.signature(post_init)
+    if tuple(post_init_signature.parameters) != ("self",):
+        raise PatchCompatibilityError(
+            f"required HCU patch target {TARGETS[0]} has incompatible "
+            f"signature {post_init_signature}"
+        )
     model_arch_signature = inspect.signature(get_model_arch_config)
     if tuple(model_arch_signature.parameters) != ("self",):
         raise PatchCompatibilityError(
-            f"required HCU patch target {TARGETS[4]} has incompatible "
+            f"required HCU patch target {TARGETS[5]} has incompatible "
             f"signature {model_arch_signature}"
         )
     with_hf_signature = inspect.signature(with_hf_config)
@@ -407,25 +553,25 @@ def apply_to_module(module: ModuleType) -> bool:
         "architectures",
     ):
         raise PatchCompatibilityError(
-            f"required HCU patch target {TARGETS[0]} has incompatible "
+            f"required HCU patch target {TARGETS[1]} has incompatible "
             f"signature {with_hf_signature}"
         )
     cudagraph_signature = inspect.signature(set_cudagraph_sizes)
     if tuple(cudagraph_signature.parameters) != ("self",):
         raise PatchCompatibilityError(
-            f"required HCU patch target {TARGETS[1]} has incompatible "
+            f"required HCU patch target {TARGETS[2]} has incompatible "
             f"signature {cudagraph_signature}"
         )
     unsupported_features_signature = inspect.signature(get_v2_unsupported_features)
     if tuple(unsupported_features_signature.parameters) != ("self",):
         raise PatchCompatibilityError(
-            f"required HCU patch target {TARGETS[2]} has incompatible "
+            f"required HCU patch target {TARGETS[3]} has incompatible "
             f"signature {unsupported_features_signature}"
         )
     validate_v2_signature = inspect.signature(validate_v2_model_runner)
     if tuple(validate_v2_signature.parameters) != ("self",):
         raise PatchCompatibilityError(
-            f"required HCU patch target {TARGETS[3]} has incompatible "
+            f"required HCU patch target {TARGETS[4]} has incompatible "
             f"signature {validate_v2_signature}"
         )
 
@@ -440,6 +586,11 @@ def apply_to_module(module: ModuleType) -> bool:
         self.hf_text_config = get_text_config()
         return get_model_arch_config(self)
 
+    @functools.wraps(post_init)
+    def hcu_post_init(self):
+        _apply_kimi_k3_source_compilation_defaults(self)
+        return post_init(self)
+
     setattr(
         model_config_class,
         "_vllm_hcu_original_get_model_arch_config",
@@ -450,6 +601,8 @@ def apply_to_module(module: ModuleType) -> bool:
         "get_model_arch_config",
         hcu_get_model_arch_config,
     )
+    setattr(vllm_config, "_vllm_hcu_original_post_init", post_init)
+    setattr(vllm_config, "__post_init__", hcu_post_init)
 
     @functools.wraps(with_hf_config)
     def hcu_with_hf_config(self, hf_config: object, architectures=None):
