@@ -43,10 +43,12 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.stats import (
     MooncakeKVConnectorStats,
 )
 from vllm.distributed.parallel_state import (
+    get_pcp_group,
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from vllm.distributed.utils import get_pp_indices
 from vllm.forward_context import ForwardContext
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import extract_layer_index
@@ -140,6 +142,41 @@ class TransferRegion:
     block_len: int
     kv_block_len: int
     group_index: int = 0
+
+
+def _normalize_pp_layer_partition(
+    partition: str, num_layers: int, pp_size: int
+) -> tuple[int, ...]:
+    """Validate an explicit partition without mutating the process environment."""
+    parts = partition.split(",")
+    if any(re.fullmatch(r"[0-9]+", part.strip()) is None for part in parts):
+        raise ValueError("Mooncake PP partition requires comma-separated layer counts.")
+    counts = tuple(int(part.strip()) for part in parts)
+    if len(counts) != pp_size or any(count <= 0 for count in counts):
+        raise ValueError("Mooncake PP partition requires one positive count per stage.")
+    if sum(counts) != num_layers:
+        raise ValueError("Mooncake PP partition must sum to the model layer count.")
+    return counts
+
+
+def _get_pp_stage_layer_range(
+    num_layers: int, pp_rank: int, pp_size: int
+) -> tuple[int, int]:
+    """Resolve a checked stage range using the current PP group rank."""
+    if (
+        any(type(value) is not int for value in (num_layers, pp_rank, pp_size))
+        or pp_size <= 0
+        or num_layers < pp_size
+        or not 0 <= pp_rank < pp_size
+    ):
+        raise ValueError("Mooncake PP requires positive stage sizes and a valid rank.")
+    partition = envs.VLLM_PP_LAYER_PARTITION
+    if partition is None:
+        # Keep upstream's default layer distribution authoritative.
+        return get_pp_indices(num_layers, pp_rank, pp_size)
+    counts = _normalize_pp_layer_partition(partition, num_layers, pp_size)
+    start = sum(counts[:pp_rank])
+    return start, start + counts[pp_rank]
 
 
 def _get_tp_ratio(local_tp_size: int, remote_tp_size: int) -> int:
@@ -333,6 +370,15 @@ def _validate_asymmetric_region_lengths(
         )
 
     if producer_cache_replicated:
+        for idx, (local_region, remote_region) in enumerate(
+            zip(local_regions, remote_regions)
+        ):
+            if local_region.kv_block_len != remote_region.kv_block_len:
+                return (
+                    "Mooncake replicated KV region length mismatch at "
+                    f"region {idx}: local={local_region.kv_block_len}, "
+                    f"remote={remote_region.kv_block_len}."
+                )
         return None
 
     tp_ratio = _get_tp_ratio(local_tp_size, remote_tp_size)
@@ -565,8 +611,10 @@ def _validate_phase1_kv_cache_config(
 def _get_tensor_dense_flag(tensor: torch.Tensor) -> bool | None:
     is_dense = getattr(tensor, "is_non_overlapping_and_dense", None)
     if callable(is_dense):
-        return bool(is_dense())
-    return None
+        is_dense = is_dense()
+    if is_dense is None or isinstance(is_dense, bool):
+        return is_dense
+    raise ValueError("Mooncake tensor dense flag must be bool or None.")
 
 
 class MooncakeXferMetadata(
@@ -629,6 +677,23 @@ class SendBlockMeta:
     sent: int = 0
     sending: int = 0
     ttft_send_start_logged: bool = False
+    # Once a snapshot is complete, the scheduler-owned KV blocks may be
+    # released while Mooncake continues reading the immutable staging buffer.
+    staging_slot: Any | None = None
+    staged_region_bases: dict[int, int] | None = None
+    staged_block_maps: list[dict[int, int]] | None = None
+    snapshot_ready: bool = False
+
+
+@dataclass
+class StagingSlot:
+    """A reusable, Mooncake-registered snapshot buffer."""
+
+    buffers: list[torch.Tensor]
+    region_base_addrs: dict[int, int]
+    capacity_by_group: list[int]
+    region_block_lens: list[int]
+    in_use: bool = False
 
 
 class MooncakeConnectorMetadata(KVConnectorMetadata):
@@ -1036,8 +1101,11 @@ class MooncakeConnectorScheduler:
         block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict[str, Any] | None]:
         """
-        Once a request is finished, determine whether request blocks
-        should be freed now or will be sent asynchronously and freed later.
+        Keep producer blocks until the worker has copied an immutable snapshot.
+
+        ``delay_free_blocks`` is now only the short snapshot fence.  The
+        worker reports ``finished_sending_reqs`` immediately after that copy;
+        the network transfer can then continue from staging independently.
         """
 
         params = request.kv_transfer_params
@@ -1160,6 +1228,19 @@ class MooncakeConnectorWorker:
         self.engine_id: EngineId = engine_id
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
+        # PCP replicates KV; it does not add shards. Only rank 0 exposes the
+        # replica for external Mooncake transfers.
+        self.pcp_size = int(
+            getattr(
+                vllm_config.parallel_config,
+                "prefill_context_parallel_size",
+                1,
+            )
+            or 1
+        )
+        self.pcp_rank = (
+            int(get_pcp_group().rank) if self.pcp_size > 1 else 0
+        )
         self.block_len_per_layer: list[int] = []
         self.kv_block_len_per_layer: list[int] = []
         self.registered_layer_names: list[str] = []
@@ -1173,13 +1254,54 @@ class MooncakeConnectorWorker:
         self.dp_rank = dp_local_rank if parallel_config.local_engines_only else dp_rank
         self.pp_size = vllm_config.parallel_config.pipeline_parallel_size
         self.pp_rank = get_pp_group().rank_in_group
+        self._pp_layer_range = (
+            _get_pp_stage_layer_range(
+                self.model_config.get_total_num_hidden_layers(),
+                self.pp_rank,
+                self.pp_size,
+            )
+            if self.pp_size > 1
+            else None
+        )
 
         self.kv_caches_base_addr: list[int] = []
+        # Cache views aligned with kv_caches_base_addr.  They are retained so
+        # the producer can snapshot completed blocks before releasing them.
+        self.registered_cache_tensors: list[torch.Tensor] = []
         self.device_kv_caches: dict[
             str,
             torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         ] = {}
         self.reqs_need_send: dict[TransferId, SendBlockMeta] = {}
+
+        extra_config = kv_transfer_config.kv_connector_extra_config or {}
+        # Staging is used by the ordinary bulk path.  A bounded pool prevents
+        # concurrent transfers from allocating an unbounded second KV cache.
+        # The layerwise flag is accepted for forward compatibility; this 25.1
+        # connector has no layerwise save path, so it keeps the original path.
+        self.layerwise_enabled = str(extra_config.get("layerwise", False)).lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        self.staging_enabled = str(
+            extra_config.get("enable_kv_staging", True)
+        ).lower() in ("1", "true", "yes", "on")
+        self.staging_pool_limit = max(
+            int(extra_config.get("kv_staging_buffer_count", 1)), 1
+        )
+        self.staging_device = str(
+            extra_config.get("kv_staging_device", "cpu")
+        ).lower()
+        self._staging_pool: list[StagingSlot] = []
+        self._staging_lock = threading.Lock()
+        logger.info(
+            "Mooncake KV staging: enabled=%s device=%s pool_limit=%d",
+            self.staging_enabled and not self.layerwise_enabled,
+            self.staging_device,
+            self.staging_pool_limit,
+        )
 
         # For kv_both, we will act both prefiller and decoder.
         if not self.is_kv_consumer:
@@ -1189,6 +1311,13 @@ class MooncakeConnectorWorker:
             self._sender_executor = ThreadPoolExecutor(
                 max_workers=self.num_sender_workers,
                 thread_name_prefix="vllm-mooncake-sender",
+                initializer=self._bind_sender_thread_device,
+            )
+            # Snapshot copies must not queue behind long-running network
+            # writes.  Use a separate executor for the copy operation.
+            self._staging_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="vllm-mooncake-staging",
                 initializer=self._bind_sender_thread_device,
             )
             logger.debug(
@@ -1218,6 +1347,8 @@ class MooncakeConnectorWorker:
             self._mooncake_receiver_t.start()
             logger.debug("Mooncake Decoder: start receiver thread")
 
+        # For staged bulk sends this means "snapshot copied"; fallback sends
+        # retain the legacy meaning of "network transfer completed".
         self.finished_sending_reqs: set[ReqId] = set()
         self.finished_recving_reqs: set[ReqId] = set()
 
@@ -1301,6 +1432,8 @@ class MooncakeConnectorWorker:
         self.async_zmq_ctx.term()
         if not self.is_kv_consumer:
             self._sender_executor.shutdown(wait=False)
+            if hasattr(self, "_staging_executor"):
+                self._staging_executor.shutdown(wait=False)
             if self.sender_loop.is_running():
                 self.sender_loop.call_soon_threadsafe(self.sender_loop.stop)
                 self._sender_listener_t.join()
@@ -1618,7 +1751,13 @@ class MooncakeConnectorWorker:
                     send_meta.sent == send_meta.need_send
                     and self.reqs_need_send.pop(send_meta.transfer_id, None) is not None
                 ):
-                    self.finished_sending_reqs.add(send_meta.p_req_id)
+                    snapshot_ready = send_meta.snapshot_ready
+                    self._release_staging_slot(send_meta)
+                    # Staged requests were already reported when the local
+                    # snapshot completed.  Fallback requests retain the old
+                    # network-completion notification semantics.
+                    if not snapshot_ready:
+                        self.finished_sending_reqs.add(send_meta.p_req_id)
 
             response = MooncakeXferResponse(
                 status=response_status,
@@ -1766,6 +1905,33 @@ class MooncakeConnectorWorker:
                 remote_block_ids_by_group
             )
 
+            # Staging uses compact IDs from the immutable snapshot.  Decode
+            # block IDs remain unchanged; only the producer source IDs are
+            # remapped.
+            if send_meta.staged_block_maps is not None:
+                if len(send_meta.staged_block_maps) != len(
+                    local_block_ids_by_group
+                ):
+                    err_reqs.append(d_req_id)
+                    if err_msg is None:
+                        err_msg = "staged KV group count mismatch"
+                    continue
+                try:
+                    local_block_ids_by_group = [
+                        [
+                            send_meta.staged_block_maps[group_index][block_id]
+                            for block_id in group
+                        ]
+                        for group_index, group in enumerate(
+                            local_block_ids_by_group
+                        )
+                    ]
+                except KeyError as exc:
+                    err_reqs.append(d_req_id)
+                    if err_msg is None:
+                        err_msg = f"staged KV block ID is missing: {exc}"
+                    continue
+
             block_id_error = _validate_nonnegative_block_ids(
                 local_block_ids_by_group,
                 remote_block_ids_by_group,
@@ -1833,9 +1999,23 @@ class MooncakeConnectorWorker:
                 for group_local_block_id, group_remote_block_id in zip(
                     group_local_block_ids, group_remote_block_ids
                 ):
+                    source_base_addr = local_region.base_addr
+                    if send_meta.staged_region_bases is not None:
+                        source_base_addr = send_meta.staged_region_bases.get(
+                            local_region.base_addr, 0
+                        )
+                        if source_base_addr <= 0:
+                            err_reqs.append(d_req_id)
+                            if err_msg is None:
+                                err_msg = (
+                                    "staged KV region is missing for "
+                                    f"{local_region.layer_name}"
+                                )
+                            has_block_error = True
+                            break
                     if can_coalesce:
                         src_ptrs.append(
-                            local_region.base_addr
+                            source_base_addr
                             + group_local_block_id[0] * local_region.block_len
                             + src_region_offset
                         )
@@ -1850,7 +2030,7 @@ class MooncakeConnectorWorker:
                             group_local_block_id, group_remote_block_id
                         ):
                             src_ptrs.append(
-                                local_region.base_addr
+                                source_base_addr
                                 + local_block_id * local_region.block_len
                                 + src_region_offset
                             )
@@ -1860,6 +2040,12 @@ class MooncakeConnectorWorker:
                                 + dst_region_offset
                             )
                             lengths.append(transfer_len)
+
+                if has_block_error:
+                    break
+
+            if has_block_error:
+                continue
 
             logger.debug(
                 "Sending kv_caches for request %s (%d blocks) to %s",
@@ -1875,6 +2061,288 @@ class MooncakeConnectorWorker:
         correct CUDA device.  CUDA device selection is thread-local, so
         without this, NVLink transfers fail for TP ranks > 0."""
         current_platform.set_device(self.device_id)
+
+    def _staging_source_regions(
+        self,
+    ) -> list[tuple[TransferRegion, torch.Tensor, int]]:
+        """Return registered source regions and their byte offsets."""
+        regions: list[tuple[TransferRegion, torch.Tensor, int]] = []
+        split_blocks = self.transfer_topo.virtually_split_kv_in_blocks
+        for (
+            cache,
+            base_addr,
+            block_len,
+            kv_block_len,
+            layer_name,
+            layer_index,
+            group_index,
+        ) in zip(
+            self.registered_cache_tensors,
+            self.kv_caches_base_addr,
+            self.block_len_per_layer,
+            self.kv_block_len_per_layer,
+            self.registered_layer_names,
+            self.registered_layer_indices,
+            self.registered_group_indices,
+        ):
+            layer_spec = self._layer_specs[layer_name]
+            offsets = (
+                (0, kv_block_len)
+                if split_blocks
+                and not isinstance(
+                    layer_spec,
+                    (MambaSpec, MLAAttentionSpec, SlidingWindowMLASpec),
+                )
+                else (0,)
+            )
+            for offset in offsets:
+                regions.append(
+                    (
+                        TransferRegion(
+                            layer_name=layer_name,
+                            layer_index=layer_index,
+                            base_addr=base_addr + offset,
+                            block_len=block_len,
+                            kv_block_len=kv_block_len,
+                            group_index=group_index,
+                        ),
+                        cache,
+                        offset,
+                    )
+                )
+        return regions
+
+    @staticmethod
+    def _cache_payload_view(
+        cache: torch.Tensor,
+        *,
+        block_len: int,
+        payload_len: int,
+        byte_offset: int,
+    ) -> torch.Tensor:
+        """Create a byte view with the same block stride as a KV cache."""
+        element_size = cache.element_size()
+        if (
+            element_size <= 0
+            or block_len % element_size
+            or payload_len % element_size
+            or byte_offset % element_size
+        ):
+            raise ValueError(
+                "Mooncake staging requires byte-aligned KV cache regions: "
+                f"block_len={block_len}, payload_len={payload_len}, "
+                f"offset={byte_offset}, element_size={element_size}."
+            )
+        typed_view = cache.as_strided(
+            size=(cache.shape[0], payload_len // element_size),
+            stride=(cache.stride(0), 1),
+            storage_offset=cache.storage_offset() + byte_offset // element_size,
+        )
+        try:
+            return typed_view.view(torch.uint8)
+        except RuntimeError as exc:
+            raise ValueError(
+                "Mooncake staging requires a dense innermost KV cache dimension"
+            ) from exc
+
+    def _new_staging_slot(
+        self,
+        capacity_by_group: list[int],
+        source_regions: list[tuple[TransferRegion, torch.Tensor, int]],
+    ) -> StagingSlot:
+        buffers: list[torch.Tensor] = []
+        region_base_addrs: dict[int, int] = {}
+        register_ptrs: list[int] = []
+        register_lens: list[int] = []
+        for region, cache, _ in source_regions:
+            capacity = max(capacity_by_group[region.group_index], 1)
+            if self.staging_device in ("device", "gpu", "hpu"):
+                buffer = torch.empty(
+                    capacity * region.block_len,
+                    dtype=torch.uint8,
+                    device=cache.device,
+                )
+            elif self.staging_device == "cpu":
+                buffer = torch.empty(
+                    capacity * region.block_len,
+                    dtype=torch.uint8,
+                    device="cpu",
+                    pin_memory=True,
+                )
+            else:
+                raise ValueError(
+                    "kv_staging_device must be 'cpu' or 'device', got "
+                    f"{self.staging_device!r}"
+                )
+            buffers.append(buffer)
+            region_base_addrs[region.base_addr] = buffer.data_ptr()
+            storage = buffer.untyped_storage()
+            register_ptrs.append(storage.data_ptr())
+            register_lens.append(storage.nbytes())
+
+        ret_value = self.engine.batch_register_memory(register_ptrs, register_lens)
+        if ret_value != 0:
+            raise RuntimeError(
+                "Mooncake staging buffer memory registration failed "
+                f"(ret={ret_value})."
+            )
+        logger.info(
+            "Mooncake staging slot allocated: groups=%s bytes=%d regions=%d",
+            capacity_by_group,
+            sum(register_lens),
+            len(buffers),
+        )
+        return StagingSlot(
+            buffers=buffers,
+            region_base_addrs=region_base_addrs,
+            capacity_by_group=capacity_by_group,
+            region_block_lens=[region.block_len for region, _, _ in source_regions],
+            in_use=True,
+        )
+
+    def _acquire_staging_slot(
+        self,
+        capacity_by_group: list[int],
+        source_regions: list[tuple[TransferRegion, torch.Tensor, int]],
+    ) -> StagingSlot | None:
+        with self._staging_lock:
+            for slot in self._staging_pool:
+                if slot.in_use or len(slot.capacity_by_group) != len(capacity_by_group):
+                    continue
+                if all(
+                    have >= need
+                    for have, need in zip(slot.capacity_by_group, capacity_by_group)
+                ) and all(
+                    slot.region_block_lens[index] == region.block_len
+                    and buffer.numel()
+                    >= max(capacity_by_group[region.group_index], 1) * region.block_len
+                    for index, (buffer, (region, _, _)) in enumerate(
+                        zip(slot.buffers, source_regions)
+                    )
+                ):
+                    slot.in_use = True
+                    return slot
+            if len(self._staging_pool) >= self.staging_pool_limit:
+                return None
+            slot = self._new_staging_slot(capacity_by_group, source_regions)
+            self._staging_pool.append(slot)
+            return slot
+
+    def _release_staging_slot(self, send_meta: SendBlockMeta) -> None:
+        slot = send_meta.staging_slot
+        if slot is None:
+            return
+        with self._staging_lock:
+            slot.in_use = False
+        send_meta.staging_slot = None
+        send_meta.staged_region_bases = None
+        send_meta.staged_block_maps = None
+
+    def _stage_send_meta(self, send_meta: SendBlockMeta) -> bool:
+        """Copy completed KV blocks into an immutable registered buffer."""
+        if not self.staging_enabled or self.layerwise_enabled:
+            return False
+        if send_meta.snapshot_ready:
+            return True
+
+        try:
+            source_regions = self._staging_source_regions()
+            kernel_blocks = self._logical_to_kernel_block_ids(
+                send_meta.local_block_ids
+            )
+            group_specs = self.kv_cache_config.kv_cache_groups
+            unique_by_group: list[list[int]] = []
+            maps_by_group: list[dict[int, int]] = []
+            for group_index, group in enumerate(kernel_blocks):
+                if isinstance(group_specs[group_index].kv_cache_spec, MambaSpec):
+                    group = [
+                        block_id
+                        for block_id in group
+                        if block_id != NULL_BLOCK_ID
+                    ]
+                mapping: dict[int, int] = {}
+                unique_ids: list[int] = []
+                for block_id in group:
+                    if block_id < 0:
+                        raise ValueError(
+                            f"negative producer block id {block_id} in group "
+                            f"{group_index}"
+                        )
+                    if block_id not in mapping:
+                        mapping[block_id] = len(unique_ids)
+                        unique_ids.append(block_id)
+                maps_by_group.append(mapping)
+                unique_by_group.append(unique_ids)
+
+            if not any(unique_by_group):
+                return False
+            capacity_by_group = [len(ids) for ids in unique_by_group]
+            slot = self._acquire_staging_slot(capacity_by_group, source_regions)
+            if slot is None:
+                logger.warning(
+                    "Mooncake staging pool exhausted for request %s; "
+                    "falling back to original KV blocks.",
+                    send_meta.p_req_id,
+                )
+                return False
+            send_meta.staging_slot = slot
+
+            # The sender executor has its own stream.  Synchronize before and
+            # after the copy so the scheduler can safely reuse source blocks.
+            torch.accelerator.synchronize()
+            for region_index, (region, cache, byte_offset) in enumerate(
+                source_regions
+            ):
+                block_ids = unique_by_group[region.group_index]
+                if not block_ids:
+                    continue
+                if max(block_ids) >= cache.shape[0]:
+                    raise ValueError(
+                        f"producer block id {max(block_ids)} exceeds cache size "
+                        f"{cache.shape[0]} for {region.layer_name}"
+                    )
+                source = self._cache_payload_view(
+                    cache,
+                    block_len=region.block_len,
+                    payload_len=region.kv_block_len,
+                    byte_offset=byte_offset,
+                )
+                indices = torch.tensor(
+                    block_ids, dtype=torch.long, device=cache.device
+                )
+                copied = source.index_select(0, indices)
+                destination = slot.buffers[region_index].view(
+                    -1, region.block_len
+                )
+                destination[: len(block_ids), : region.kv_block_len].copy_(copied)
+            torch.accelerator.synchronize()
+        except Exception:
+            if "slot" in locals():
+                self._release_staging_slot(send_meta)
+            logger.exception(
+                "Mooncake KV staging failed for request %s; using original blocks",
+                send_meta.p_req_id,
+            )
+            return False
+
+        send_meta.staged_region_bases = slot.region_base_addrs
+        send_meta.staged_block_maps = maps_by_group
+        send_meta.snapshot_ready = True
+        # This is the snapshot-complete notification.  The network transfer
+        # continues independently and must not delay scheduler block reuse.
+        sender_loop = getattr(self, "sender_loop", None)
+        if sender_loop is not None:
+            sender_loop.call_soon_threadsafe(
+                self.finished_sending_reqs.add, send_meta.p_req_id
+            )
+        else:
+            self.finished_sending_reqs.add(send_meta.p_req_id)
+        log_ttft_event(
+            "p_snapshot_done",
+            transfer_id=send_meta.transfer_id,
+            req_id=send_meta.p_req_id,
+        )
+        return True
 
     def _send_blocks(
         self,
@@ -1927,6 +2395,7 @@ class MooncakeConnectorWorker:
         self.registered_layer_names = []
         self.registered_layer_indices = []
         self.registered_group_indices = []
+        self.registered_cache_tensors = []
 
         for layer_name, cache_or_caches in kv_caches.items():
             layer_index = extract_layer_index(layer_name)
@@ -1937,6 +2406,12 @@ class MooncakeConnectorWorker:
                     layer_name,
                 )
                 continue
+            if self._pp_layer_range is not None:
+                start, end = self._pp_layer_range
+                if not start <= layer_index < end:
+                    raise ValueError(
+                        f"Mooncake layer {layer_name} is outside PP stage [{start}, {end})."
+                    )
             if isinstance(cache_or_caches, tuple):
                 if len(cache_or_caches) != 2 or not all(
                     isinstance(cache, torch.Tensor) for cache in cache_or_caches
@@ -1972,6 +2447,7 @@ class MooncakeConnectorWorker:
                 base_addr = cache.data_ptr()
                 block_len = cache.stride(0) * cache.element_size()
                 region_base_addresses.append(base_addr)
+                self.registered_cache_tensors.append(cache)
 
                 if isinstance(layer_spec, (MLAAttentionSpec, SlidingWindowMLASpec)):
                     kv_block_len = layer_spec.page_size_bytes
@@ -2063,6 +2539,15 @@ class MooncakeConnectorWorker:
         # No need to launch server for D node.
         if self.is_kv_consumer:
             return
+        # Non-canonical PCP replicas do not listen or register externally.
+        if not self._is_canonical_pcp_kv_replica():
+            logger.info(
+                "Mooncake PCP replica skip listen/register: pcp_rank=%s "
+                "pcp_size=%s (rank0 sends the KV replica)",
+                self.pcp_rank,
+                self.pcp_size,
+            )
+            return
 
         ready_event = threading.Event()
         asyncio.run_coroutine_threadsafe(
@@ -2096,7 +2581,13 @@ class MooncakeConnectorWorker:
                     envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT,
                 )
                 self.xfer_stats.record_kv_expired_req()
-                finished_sending_reqs.add(send_meta.p_req_id)
+                snapshot_ready = send_meta.snapshot_ready
+                self._release_staging_slot(send_meta)
+                # Snapshot completion already notified the scheduler.  The
+                # timeout path only needs to notify it for the legacy/fallback
+                # source path.
+                if not snapshot_ready:
+                    finished_sending_reqs.add(send_meta.p_req_id)
                 expired_transfer_id.append(transfer_id)
 
         for transfer_id in expired_transfer_id:
@@ -2364,12 +2855,21 @@ class MooncakeConnectorWorker:
                 send_meta.expire_time = (
                     time.perf_counter() + envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT
                 )
-                send_meta.ready.set()
                 log_ttft_event(
                     "p_ready",
                     transfer_id=transfer_id,
                     req_id=p_req_id,
                 )
+                # Complete the local snapshot before publishing ``ready``.
+                # Once the snapshot notification reaches the scheduler, the
+                # original block IDs may be reused by another prefill.
+                if not self.layerwise_enabled:
+                    await self.sender_loop.run_in_executor(
+                        self._staging_executor,
+                        self._stage_send_meta,
+                        send_meta,
+                    )
+                send_meta.ready.set()
             else:
                 # From update_state_after_alloc(),
                 # but not reach request_finished() yet
@@ -2387,6 +2887,28 @@ class MooncakeConnectorWorker:
             if send_meta is not None:
                 assert not send_meta.ready.is_set()
 
+    def _is_canonical_pcp_kv_replica(self) -> bool:
+        """Return whether this worker owns the canonical PCP KV replica."""
+
+        return int(getattr(self, "pcp_size", 1) or 1) <= 1 or int(
+            getattr(self, "pcp_rank", 0)
+        ) == 0
+
+    async def _complete_noncanonical_pcp_sends(
+        self, metadata: MooncakeConnectorMetadata
+    ) -> None:
+        """Complete sends without transferring KV so Decode does not wait."""
+
+        for p_req_id, (_transfer_id, block_ids) in metadata.reqs_to_send.items():
+            if not block_ids:
+                # Alloc-time placeholder; report complete on request_finished.
+                continue
+            self.finished_sending_reqs.add(p_req_id)
+        for transfer_id in metadata.reqs_not_processed:
+            send_meta = self.reqs_need_send.pop(transfer_id, None)
+            if send_meta is not None and send_meta.p_req_id:
+                self.finished_sending_reqs.add(send_meta.p_req_id)
+
     def start_load_kv(self, metadata: MooncakeConnectorMetadata):
         if not self.is_kv_producer and metadata.reqs_to_recv:
             asyncio.run_coroutine_threadsafe(
@@ -2396,9 +2918,12 @@ class MooncakeConnectorWorker:
         if not self.is_kv_consumer and (
             metadata.reqs_to_send or metadata.reqs_not_processed
         ):
-            asyncio.run_coroutine_threadsafe(
-                self.record_send_reqs(metadata), self.sender_loop
+            send_coro = (
+                self.record_send_reqs(metadata)
+                if self._is_canonical_pcp_kv_replica()
+                else self._complete_noncanonical_pcp_sends(metadata)
             )
+            asyncio.run_coroutine_threadsafe(send_coro, self.sender_loop)
 
     def _producer_cache_is_replicated(self) -> bool:
         return self.transfer_topo.local_replicates_kv_cache
@@ -2505,6 +3030,17 @@ def _async_loop(loop: asyncio.AbstractEventLoop):
 
 def should_launch_bootstrap_server(vllm_config: VllmConfig) -> bool:
     assert (parallel_config := vllm_config.parallel_config)
+    kv_role = getattr(vllm_config.kv_transfer_config, "kv_role", None)
+    if kv_role not in ("kv_producer", "kv_both"):
+        return False
+    if parallel_config.prefill_context_parallel_size > 1:
+        if kv_role != "kv_producer":
+            return False
+        pcp_group = get_pcp_group()
+        # GroupCoordinator.rank is global. Never use local_rank or a fallback
+        # that assumes rank zero when the distributed group is unavailable.
+        if pcp_group.rank != 0 or not pcp_group.is_first_rank:
+            return False
     # Only the TP=0, PP=0 worker of the designated engine should launch it.
     if get_tensor_model_parallel_rank() != 0:
         return False
