@@ -1208,6 +1208,17 @@ class MooncakeConnectorWorker:
         self.engine_id: EngineId = engine_id
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
+        # PCP replicates KV; it does not add shards. Only rank 0 exposes the
+        # replica for external Mooncake transfers.
+        self.pcp_size = int(
+            getattr(
+                vllm_config.parallel_config,
+                "prefill_context_parallel_size",
+                1,
+            )
+            or 1
+        )
+        self.pcp_rank = int(get_pcp_group().rank) if self.pcp_size > 1 else 0
         self.block_len_per_layer: list[int] = []
         self.kv_block_len_per_layer: list[int] = []
         self.registered_layer_names: list[str] = []
@@ -2126,6 +2137,15 @@ class MooncakeConnectorWorker:
         # No need to launch server for D node.
         if self.is_kv_consumer:
             return
+        # Non-canonical PCP replicas do not listen or register externally.
+        if not self._is_canonical_pcp_kv_replica():
+            logger.info(
+                "Mooncake PCP replica skip listen/register: pcp_rank=%s "
+                "pcp_size=%s (rank0 sends the KV replica)",
+                self.pcp_rank,
+                self.pcp_size,
+            )
+            return
 
         ready_event = threading.Event()
         asyncio.run_coroutine_threadsafe(
@@ -2450,6 +2470,28 @@ class MooncakeConnectorWorker:
             if send_meta is not None:
                 assert not send_meta.ready.is_set()
 
+    def _is_canonical_pcp_kv_replica(self) -> bool:
+        """Return whether this worker owns the canonical PCP KV replica."""
+
+        return int(getattr(self, "pcp_size", 1) or 1) <= 1 or int(
+            getattr(self, "pcp_rank", 0)
+        ) == 0
+
+    async def _complete_noncanonical_pcp_sends(
+        self, metadata: MooncakeConnectorMetadata
+    ) -> None:
+        """Complete sends without transferring KV so the scheduler does not wait."""
+
+        for p_req_id, (_transfer_id, block_ids) in metadata.reqs_to_send.items():
+            if not block_ids:
+                # Alloc-time placeholder; report complete on request_finished.
+                continue
+            self.finished_sending_reqs.add(p_req_id)
+        for transfer_id in metadata.reqs_not_processed:
+            send_meta = self.reqs_need_send.pop(transfer_id, None)
+            if send_meta is not None and send_meta.p_req_id:
+                self.finished_sending_reqs.add(send_meta.p_req_id)
+
     def start_load_kv(self, metadata: MooncakeConnectorMetadata):
         if not self.is_kv_producer and metadata.reqs_to_recv:
             asyncio.run_coroutine_threadsafe(
@@ -2459,9 +2501,12 @@ class MooncakeConnectorWorker:
         if not self.is_kv_consumer and (
             metadata.reqs_to_send or metadata.reqs_not_processed
         ):
-            asyncio.run_coroutine_threadsafe(
-                self.record_send_reqs(metadata), self.sender_loop
+            send_coro = (
+                self.record_send_reqs(metadata)
+                if self._is_canonical_pcp_kv_replica()
+                else self._complete_noncanonical_pcp_sends(metadata)
             )
+            asyncio.run_coroutine_threadsafe(send_coro, self.sender_loop)
 
     def _producer_cache_is_replicated(self) -> bool:
         return self.transfer_topo.local_replicates_kv_cache
