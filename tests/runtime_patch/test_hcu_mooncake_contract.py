@@ -957,6 +957,135 @@ def test_hyv4_producer_only_pcp_launches_one_bootstrap_per_global_first_rank(
     assert owners == ([0] if role == "kv_producer" else [])
 
 
+def test_pcp_disabled_does_not_query_pcp_group(mooncake, monkeypatch):
+    def _unused_group():
+        raise AssertionError("PCP group is not consulted when pcp_size <= 1")
+
+    monkeypatch.setattr(mooncake, "get_pcp_group", _unused_group)
+    size, rank = mooncake._pcp_kv_replica_coord(
+        SimpleNamespace(prefill_context_parallel_size=1)
+    )
+    worker = object.__new__(mooncake.MooncakeConnectorWorker)
+    worker.pcp_size = size
+    worker.pcp_rank = rank
+
+    assert (size, rank) == (1, 0)
+    assert worker._is_canonical_pcp_kv_replica()
+
+
+def test_pcp_tp_registers_one_sender_per_tp_group_and_pairs_decode(
+    mooncake, monkeypatch
+):
+    """HYV4 producer PCP=2 TP=4 keeps four senders and one bootstrap server.
+
+    PCP groups are [0, 4], [1, 5], [2, 6], [3, 7]. Global rank 0 is the only
+    bootstrap owner. Each group's rank_in_group 0 (global ranks 0-3) must
+    still register, or Decode infers producer TP size 1 and rejects D ranks
+    1-3.
+    """
+
+    from vllm.distributed import parallel_state
+
+    tp_size = 4
+    pcp_size = 2
+    world = tp_size * pcp_size
+    group = object.__new__(parallel_state.GroupCoordinator)
+    monkeypatch.setattr(mooncake, "get_pcp_group", lambda: group)
+    monkeypatch.setattr(
+        mooncake, "get_pp_group", lambda: SimpleNamespace(rank_in_group=0)
+    )
+    config = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(kv_role="kv_producer"),
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=pcp_size,
+            local_engines_only=False,
+            data_parallel_index=0,
+        ),
+    )
+    senders: dict[int, int] = {}
+    bootstrap_owners: list[int] = []
+    for global_rank in range(world):
+        tp_rank = global_rank % tp_size
+        members = list(range(tp_rank, world, tp_size))
+        group.rank = global_rank
+        group.ranks = members
+        group.rank_in_group = members.index(global_rank)
+        monkeypatch.setattr(
+            mooncake,
+            "get_tensor_model_parallel_rank",
+            lambda tp_rank=tp_rank: tp_rank,
+        )
+        size, pcp_rank = mooncake._pcp_kv_replica_coord(config.parallel_config)
+        worker = object.__new__(mooncake.MooncakeConnectorWorker)
+        worker.pcp_size = size
+        worker.pcp_rank = pcp_rank
+        if worker._is_canonical_pcp_kv_replica():
+            senders[tp_rank] = global_rank
+        if mooncake.should_launch_bootstrap_server(config):
+            bootstrap_owners.append(global_rank)
+
+    assert senders == {0: 0, 1: 1, 2: 2, 3: 3}
+    assert bootstrap_owners == [0]
+
+    registry = {
+        "0": {
+            "engine_id": "prefill",
+            "worker_addr": {
+                str(tp_rank): {"0": f"tcp://prefill:{9000 + tp_rank}"}
+                for tp_rank in senders
+            },
+        }
+    }
+
+    class _Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return registry
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def get(self, url):
+            assert url.endswith("/query")
+            return _Response()
+
+    monkeypatch.setattr(mooncake.httpx, "AsyncClient", lambda *_a, **_k: _Client())
+    decoder = object.__new__(mooncake.MooncakeConnectorWorker)
+    decoder._remote_agents = {}
+    decoder._tp_size = {}
+    decoder._pending_bootstrap_queries = {"http://prefill:1": asyncio.Event()}
+    asyncio.run(decoder._connect_to_prefiller_bootstrap("http://prefill:1"))
+
+    assert decoder._tp_size["prefill"] == tp_size
+    assert sorted(decoder._remote_agents["prefill"]) == [0, 1, 2, 3]
+
+    def _topology(tp_rank: int):
+        return mooncake.TransferTopology(
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            block_size=16,
+            engine_id="engine",
+            is_mla=True,
+            is_mamba=False,
+            total_num_kv_heads=tp_size,
+            attn_backends=[],
+        )
+
+    for decode_rank in range(tp_size):
+        targets = _topology(decode_rank).handshake_target_ranks(
+            decoder._tp_size["prefill"]
+        )
+        assert targets == [decode_rank]
+        accepted = _topology(targets[0]).handshake_target_ranks(tp_size)
+        assert decode_rank in accepted
+
+
 @pytest.mark.parametrize("role,expected", [
     ("kv_producer", True), ("kv_both", True), ("kv_consumer", False), (None, False),
 ])
