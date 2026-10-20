@@ -1065,6 +1065,13 @@ def test_pcp_tp_registers_one_sender_per_tp_group_and_pairs_decode(
     assert decoder._tp_size["prefill"] == tp_size
     assert sorted(decoder._remote_agents["prefill"]) == [0, 1, 2, 3]
 
+    class _KvShapeBackend:
+        """Satisfy vLLM 0.25.1 TransferTopology.__post_init__ attn_backends[0]."""
+
+        @staticmethod
+        def get_kv_cache_shape(num_blocks, block_size, num_kv_heads, head_size):
+            return (2, num_blocks, num_kv_heads, block_size, head_size)
+
     def _topology(tp_rank: int):
         return mooncake.TransferTopology(
             tp_rank=tp_rank,
@@ -1074,7 +1081,7 @@ def test_pcp_tp_registers_one_sender_per_tp_group_and_pairs_decode(
             is_mla=True,
             is_mamba=False,
             total_num_kv_heads=tp_size,
-            attn_backends=[],
+            attn_backends=[_KvShapeBackend],
         )
 
     for decode_rank in range(tp_size):
