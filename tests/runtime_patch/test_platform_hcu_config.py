@@ -1295,6 +1295,7 @@ def test_slimquant_uses_public_registry_without_loading_concrete_kernels(
         "slimquant_compressed_tensors_marlin",
         "slimquant_w4a8",
         "kimi_k3_w4a8",
+        "glm_moe_dsa_w4a8",
     ]
     assert not patch_slimquant_registry.apply_to_module(module)
 

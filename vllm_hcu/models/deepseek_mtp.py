@@ -41,6 +41,10 @@ from vllm.sequence import IntermediateTensors
 import vllm_hcu.platforms.envs as henvs
 from vllm_hcu.v1.attention.lightly_cp_utils import lightly_cp_inputs_splitting
 
+from vllm_hcu.model_executor.layers.quantization.glm_channel_int4 import (
+    normalize_routed_expert_checkpoint_name,
+)
+
 from .deepseek_v2 import (
     DeepseekV2DecoderLayer,
     DeepseekV2MixtureOfExperts,
@@ -142,6 +146,10 @@ class DeepSeekMultiTokenPredictor(nn.Module):
         config = vllm_config.model_config.hf_config
         self.mtp_start_layer_idx = config.num_hidden_layers
         self.num_mtp_layers = config.num_nextn_predict_layers
+        # 后续 MTP 草稿步复用第 0 步算出的 top-k。未设置时每步都重新计算。
+        self.share_indexer_across_mtp_steps = bool(
+            getattr(config, "index_share_for_mtp_iteration", False)
+        )
         # to map the exact layer index from weights
 
         self.layers = torch.nn.ModuleDict(
@@ -200,6 +208,8 @@ class DeepSeekMultiTokenPredictor(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
+        if self.share_indexer_across_mtp_steps:
+            self.set_skip_topk(spec_step_idx > 0)
         current_step_idx = spec_step_idx % self.num_mtp_layers
 
         enable_lightly_cp = get_forward_context().enable_lightly_cp
@@ -346,10 +356,19 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts, SupportsPP):
         loaded_params: set[str] = set()
         # Determine whether to load the indexer weight
         mtp_has_indexer = any("indexer" in param_name for param_name in params_dict.keys())
+        experts_use_unpacked_weight = not any(
+            param_name.endswith("w13_weight_packed") for param_name in params_dict
+        )
         _pending_wk_fp8: dict = {}  # FP8 indexer wk dequant buffer
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
+            normalized_name = normalize_routed_expert_checkpoint_name(
+                name, experts_use_unpacked_weight
+            )
+            if normalized_name is None:
+                continue
+            name = normalized_name
             #  Skip loading mtp indexer weights
             if "indexer" in name and not mtp_has_indexer:
                 logger.info(f"Skipping mtp indexer weight (DSA disabled): {name}")

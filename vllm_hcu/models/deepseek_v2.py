@@ -118,6 +118,10 @@ from vllm.model_executor.models.utils import (
 )
 
 import vllm_hcu.platforms.envs as henvs
+from vllm_hcu.model_executor.layers.quantization.glm_channel_int4 import (
+    is_shared_indexer_layer,
+    normalize_routed_expert_checkpoint_name,
+)
 from vllm_hcu.patch.config import get_hcu_config
 from vllm_hcu.platforms.hcu import on_gfx938
 from vllm_hcu.v1.attention.lightly_cp_utils import lightly_cp_inputs_splitting
@@ -1164,7 +1168,13 @@ class DeepseekV2MLAAttention(nn.Module):
         self.is_v32 = hasattr(config, "index_topk") and not henvs.VLLM_HCU_DISABLE_DSA
 
         _skip_topk = False
-        if self.is_v32:
+        # indexer_types 标成 shared 的主干层没有 wk，复用前一个 full 层写入的 top-k。
+        share_indexer = False
+        if self.is_v32 and getattr(config, "indexer_types", None) is not None:
+            share_indexer = is_shared_indexer_layer(
+                config, extract_layer_index(prefix)
+            )
+        if self.is_v32 and not share_indexer:
             self.indexer_rope_emb = get_rope(
                 qk_rope_head_dim,
                 max_position=max_position_embeddings,
@@ -1184,8 +1194,9 @@ class DeepseekV2MLAAttention(nn.Module):
 
             # Enable IndexCache for DeepSeek models to reduce redundant top-k
             # token selection computations in sparse attention.
+            # 已有 indexer_types 时以它为准，避免 freq 公式再改写 full/shared。
             use_index_cache = getattr(config, "use_index_cache", False)
-            if use_index_cache:
+            if use_index_cache and getattr(config, "indexer_types", None) is None:
                 # IndexCache config
                 # Refer: https://arxiv.org/abs/2603.12201 for more details.
                 _index_topk_freq = getattr(config, "index_topk_freq", 1)
@@ -1195,6 +1206,10 @@ class DeepseekV2MLAAttention(nn.Module):
                     _skip_topk = max(layer_id - 1, 0) % _index_topk_freq != 0
                 elif 0 <= layer_id < len(_index_topk_pattern):
                     _skip_topk = _index_topk_pattern[layer_id] == "S"
+        elif share_indexer:
+            self.indexer_rope_emb = None
+            self.indexer = None
+            _skip_topk = True
         else:
             self.indexer_rope_emb = None
             self.indexer = None
@@ -1587,10 +1602,19 @@ class DeepseekV2Model(nn.Module):
             for name in params_dict
             if ".indexer." in name
         }
+        experts_use_unpacked_weight = not any(
+            param_name.endswith("w13_weight_packed") for param_name in params_dict
+        )
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
-            
+            normalized_name = normalize_routed_expert_checkpoint_name(
+                name, experts_use_unpacked_weight
+            )
+            if normalized_name is None:
+                continue
+            name = normalized_name
+
             if not _is_local_indexer_weight(name, indexer_present_prefixes):
                 continue
 
