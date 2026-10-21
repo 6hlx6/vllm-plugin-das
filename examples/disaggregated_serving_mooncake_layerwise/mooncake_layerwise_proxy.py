@@ -23,6 +23,7 @@ _PENDING: dict[str, dict] = {}
 _PENDING_LOCK = threading.Lock()
 _PREFILL_URL = ""
 _PREFILL_HOST = ""
+_NOTIFY_HOST = ""
 _BOOTSTRAP_PORT = 8998
 _DECODE_URL = ""
 _NOTIFY_TIMEOUT_S = 120.0
@@ -41,7 +42,8 @@ def _run_prefill(body: dict, transfer_id: str, request_path: str) -> None:
     prefill_body["stream"] = False
     params = dict(prefill_body.get("kv_transfer_params") or {})
     # 用 Prefill 机器的地址，避免 Worker 在容器里访问不到 127.0.0.1 上的代理。
-    notify_host = _PREFILL_HOST or "127.0.0.1"
+    # The notify endpoint may run on a different host than the prefiller.
+    notify_host = _NOTIFY_HOST or _PREFILL_HOST or "127.0.0.1"
     params.update(
         {
             "do_remote_decode": True,
@@ -94,16 +96,15 @@ def _decode_params_from_prefill(prefill: dict, transfer_id: str) -> dict | None:
     return merged
 
 
-def _forward_decode(body: dict, params: dict, request_path: str) -> tuple[int, bytes]:
+def _forward_decode(body: dict, params: dict, request_path: str):
     decode_body = copy.deepcopy(body)
-    decode_body["stream"] = False
     decode_body["kv_transfer_params"] = params
-    response = httpx.post(
+    return httpx.stream(
+        "POST",
         _DECODE_URL.rstrip("/") + request_path,
         json=decode_body,
         timeout=None,
     )
-    return response.status_code, response.content
 
 
 _PROXY_PORT = 8001
@@ -126,6 +127,22 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
+
+    def _write_stream(self, response: httpx.Response) -> None:
+        """Forward the decode stream so the client can observe TTFT."""
+        self.send_response(response.status_code)
+        self.send_header(
+            "Content-Type",
+            response.headers.get("content-type", "text/event-stream"),
+        )
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+        for chunk in response.iter_bytes():
+            if chunk:
+                self.wfile.write(chunk)
+                self.wfile.flush()
 
     def do_POST(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
@@ -184,11 +201,19 @@ class _Handler(BaseHTTPRequestHandler):
             self._write(502, message, "application/json")
             return
         try:
-            status, content = _forward_decode(body, params, path)
+            with _forward_decode(body, params, path) as response:
+                if body.get("stream"):
+                    self._write_stream(response)
+                else:
+                    content = response.read()
+                    self._write(
+                        response.status_code,
+                        content,
+                        response.headers.get("content-type", "application/json"),
+                    )
         except Exception as exc:
             content = json.dumps({"error": str(exc)}).encode("utf-8")
-            status = 502
-        self._write(status, content, "application/json")
+            self._write(502, content, "application/json")
         with _PENDING_LOCK:
             _PENDING.pop(transfer_id, None)
 
@@ -198,12 +223,19 @@ def main() -> None:
     parser.add_argument("--prefill", nargs=2, metavar=("URL", "BOOTSTRAP_PORT"), required=True)
     parser.add_argument("--decode", required=True)
     parser.add_argument("--port", type=int, default=8001)
+    parser.add_argument(
+        "--notify-host",
+        default="",
+        help="Host reachable by prefiller workers for the /notify callback.",
+    )
     args = parser.parse_args()
-    global _PREFILL_URL, _PREFILL_HOST, _BOOTSTRAP_PORT, _DECODE_URL, _PROXY_PORT
+    global _PREFILL_URL, _PREFILL_HOST, _BOOTSTRAP_PORT
+    global _DECODE_URL, _PROXY_PORT, _NOTIFY_HOST
     _PREFILL_URL = args.prefill[0]
     _BOOTSTRAP_PORT = int(args.prefill[1])
     _DECODE_URL = args.decode
     _PROXY_PORT = args.port
+    _NOTIFY_HOST = args.notify_host
     _PREFILL_HOST = urlparse(_PREFILL_URL).hostname or "127.0.0.1"
     server = ThreadingHTTPServer(("0.0.0.0", args.port), _Handler)
     print(
