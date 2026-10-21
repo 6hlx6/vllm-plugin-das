@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import os
+import threading
 from types import SimpleNamespace
 
 import msgspec
@@ -1091,6 +1092,202 @@ def test_pcp_tp_registers_one_sender_per_tp_group_and_pairs_decode(
         assert targets == [decode_rank]
         accepted = _topology(targets[0]).handshake_target_ranks(tp_size)
         assert decode_rank in accepted
+
+
+def test_pcp_tp_multi_sender_holds_blocks_until_every_sender_finishes(
+    mooncake, monkeypatch
+):
+    """PCP=2 TP=4 keeps four live senders and does not free blocks early.
+
+    Replica ranks report completion without RDMA. The scheduler aggregator
+    still waits until each TP group's PCP-local rank 0 finishes its send.
+    """
+
+    from vllm.distributed import parallel_state
+    from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
+    from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
+
+    tp_size = 4
+    pcp_size = 2
+    world = tp_size * pcp_size
+    req_id = "prefill-1"
+    transfer_id = "xfer-pcp"
+    group = object.__new__(parallel_state.GroupCoordinator)
+    monkeypatch.setattr(mooncake, "get_pcp_group", lambda: group)
+
+    scheduler = object.__new__(mooncake.MooncakeConnectorScheduler)
+    scheduler.is_kv_producer = True
+    scheduler.is_kv_consumer = False
+    scheduler._reqs_need_recv = {}
+    scheduler._reqs_need_send = {}
+    scheduler._reqs_not_processed = set()
+    scheduler._is_hma_required = False
+    scheduler._has_mamba = False
+    scheduler.blocks_per_sw = []
+    request = SimpleNamespace(
+        request_id=req_id,
+        kv_transfer_params={"do_remote_decode": True, "transfer_id": transfer_id},
+        status=mooncake.RequestStatus.FINISHED_LENGTH_CAPPED,
+    )
+    delay_free, _params = scheduler.request_finished(request, ([11, 12],))
+    metadata = scheduler.build_connector_meta(SimpleNamespace())
+    assert delay_free is True
+    assert metadata.reqs_to_send[req_id] == (transfer_id, [[11, 12]])
+
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+    scheduled: list[asyncio.Future] = []
+    real_submit = asyncio.run_coroutine_threadsafe
+
+    def _submit(coro, target_loop):
+        future = real_submit(coro, target_loop)
+        scheduled.append(future)
+        return future
+
+    monkeypatch.setattr(mooncake.asyncio, "run_coroutine_threadsafe", _submit)
+    workers = []
+    try:
+        for global_rank in range(world):
+            tp_rank = global_rank % tp_size
+            members = list(range(tp_rank, world, tp_size))
+            group.rank = global_rank
+            group.ranks = members
+            group.rank_in_group = members.index(global_rank)
+            size, pcp_rank = mooncake._pcp_kv_replica_coord(
+                SimpleNamespace(prefill_context_parallel_size=pcp_size)
+            )
+            worker = object.__new__(mooncake.MooncakeConnectorWorker)
+            worker.sender_loop = loop
+            worker.is_kv_producer = True
+            worker.is_kv_consumer = False
+            worker.tp_rank = tp_rank
+            worker.tp_size = tp_size
+            worker.pcp_size = size
+            worker.pcp_rank = pcp_rank
+            worker.finished_sending_reqs = set()
+            worker.finished_recving_reqs = set()
+            worker.reqs_need_send = {}
+            worker.registered_layer_names = []
+            worker.registered_layer_indices = []
+            worker.registered_group_indices = []
+            worker.kv_caches_base_addr = []
+            worker.block_len_per_layer = []
+            worker.kv_block_len_per_layer = []
+            worker._encoder = msgspec.msgpack.Encoder()
+            worker._get_transfer_regions = lambda *_args, **_kwargs: []
+            worker.transfer_topo = SimpleNamespace(
+                local_replicates_kv_cache=False,
+                handshake_target_ranks=lambda remote_tp_size, rank=tp_rank: [rank]
+                if remote_tp_size == tp_size
+                else [],
+            )
+            if worker._is_canonical_pcp_kv_replica():
+                worker.reqs_need_send[transfer_id] = mooncake.SendBlockMeta(
+                    p_req_id="",
+                    transfer_id=transfer_id,
+                    local_block_ids=[],
+                    ready=asyncio.Event(),
+                )
+            before = len(scheduled)
+            worker.start_load_kv(metadata)
+            scheduled[before].result(timeout=5)
+            workers.append(worker)
+
+        canonical = [worker for worker in workers if worker._is_canonical_pcp_kv_replica()]
+        replicas = [worker for worker in workers if worker not in canonical]
+        assert [worker.tp_rank for worker in canonical] == [0, 1, 2, 3]
+        assert all(worker.pcp_rank == 0 for worker in canonical)
+        assert all(worker.finished_sending_reqs == set() for worker in canonical)
+        assert all(
+            worker.reqs_need_send[transfer_id].ready.is_set()
+            and worker.reqs_need_send[transfer_id].local_block_ids == [[11, 12]]
+            for worker in canonical
+        )
+        assert all(worker.finished_sending_reqs == {req_id} for worker in replicas)
+        assert all(transfer_id not in worker.reqs_need_send for worker in replicas)
+
+        def _runner(finished: set[str] | None) -> ModelRunnerOutput:
+            return ModelRunnerOutput(
+                req_ids=[req_id],
+                req_id_to_index={req_id: 0},
+                kv_connector_output=KVConnectorOutput(finished_sending=finished),
+            )
+
+        aggregator = KVOutputAggregator(world)
+        held = aggregator.aggregate(
+            [
+                _runner(set(worker.finished_sending_reqs) or None)
+                for worker in workers
+            ]
+        )
+        assert held is not None
+        assert not held.kv_connector_output.finished_sending
+
+        transfer_calls: list[int] = []
+
+        async def _stand_in_transfer(
+            ready_reqs,
+            _agent_meta,
+            _local_regions,
+            _remote_regions,
+            tp_rank,
+        ):
+            assert ready_reqs[0][1].local_block_ids == [[11, 12]]
+            transfer_calls.append(tp_rank)
+            return [], [], [], [], None
+
+        class _Sock:
+            def __init__(self):
+                self.sent: list[tuple] = []
+
+            async def send_multipart(self, parts):
+                self.sent.append(parts)
+
+        def _transfer_for(tp_rank: int):
+            async def _run(ready_reqs, agent_meta, local_regions, remote_regions):
+                return await _stand_in_transfer(
+                    ready_reqs,
+                    agent_meta,
+                    local_regions,
+                    remote_regions,
+                    tp_rank,
+                )
+
+            return _run
+
+        for worker in canonical:
+            worker._build_transfer_params = _transfer_for(worker.tp_rank)
+            sock = _Sock()
+            xfer = _metadata(
+                mooncake,
+                remote_tp_size=tp_size,
+                remote_tp_rank=worker.tp_rank,
+                req_blocks={"decode-1": (transfer_id, [[21, 22]])},
+            )
+            real_submit(
+                worker.send_kv_to_decode(b"decode", sock, xfer), loop
+            ).result(timeout=5)
+            response = msgspec.msgpack.decode(
+                sock.sent[-1][1], type=mooncake.MooncakeXferResponse
+            )
+            assert response.status == mooncake.MooncakeXferResponseStatus.FINISH
+            assert response.err_reqs is None
+            finished = real_submit(
+                worker.fetch_finished_sending_reqs(), loop
+            ).result(timeout=5)
+            assert finished == {req_id}
+
+        assert transfer_calls == [0, 1, 2, 3]
+        released = aggregator.aggregate(
+            [_runner({req_id}) for _worker in canonical]
+            + [_runner(None) for _worker in replicas]
+        )
+        assert released.kv_connector_output.finished_sending == {req_id}
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=5)
+        loop.close()
 
 
 @pytest.mark.parametrize("role,expected", [
