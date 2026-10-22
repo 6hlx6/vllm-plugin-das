@@ -103,6 +103,16 @@ def test_aiter_w4a8_repack_regroups_eight_nibbles() -> None:
     assert repacked.tolist() == [[0x04, 0x15, 0x26, 0x37]]
 
 
+def test_glm_aiter_path_uses_gemm2_shuffle_without_generic_shuffle() -> None:
+    from pathlib import Path
+
+    source = Path(
+        "vllm_hcu/model_executor/layers/quantization/glm_moe_dsa_w4a8.py"
+    ).read_text(encoding="utf-8")
+    assert "repack_and_shuffle_w4a8" in source
+    assert "aiter_config.need_shuffle = False" in source
+
+
 def test_int4_converter_rejects_unpacked_storage() -> None:
     with pytest.raises(ValueError, match="int32"):
         convert_compressed_tensors_int4_to_slimquant(torch.zeros(2, 4, dtype=torch.int8))

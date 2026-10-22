@@ -22,7 +22,6 @@ from vllm_hcu.model_executor.layers.quantization.glm_channel_int4 import (
     convert_compressed_tensors_int4_to_slimquant,
     is_glm_channel_int4_w4a8,
     is_glm_moe_dsa_model,
-    repack_slimquant_w4a8_for_aiter,
 )
 from vllm_hcu.model_executor.layers.quantization.slimquant_w4a8 import (
     SlimQuantW4A8Int8AiterMoEMethod,
@@ -72,29 +71,45 @@ class GlmMoeDsaW4A8MoEMethod(SlimQuantW4A8Int8AiterMoEMethod):
             _wrap_checkpoint_loader(getattr(layer, name), scale=True)
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
-        # The checkpoint loader leaves each expert in SlimQuant's packed
-        # high-nibble-first representation.  Before the shared SlimQuant
-        # post-load path probes AITER, regroup the eight INT4 values required
-        # by the W4A8 moe_c layout.  The shared path then performs at most one
-        # AITER layout shuffle.  Do not apply this transformation to the
-        # explicit Triton fallback, which expects the native packed order.
-        if (
-            getattr(self.moe, "moe_backend", "auto") != "triton"
-            and not getattr(layer, "_glm_w4a8_aiter_regrouped", False)
-        ):
-            from vllm_hcu.model_executor.layers.quantization.compressed_tensors_moe_runtime import (
-                prewarm_aiter_w4a8_moe,
+        """把 expert 收成 AITER W4A8 的 gemm2 布局，并避免再做通用 shuffle。
+
+        只做 8-nibble 重排仍然是 SlimQuant 的逐对字节序。AITER moe_c 要的是
+        这次重排之后再走 ``w4a8_moe_layout_shuffle_gemm2``。父类在
+        ``need_shuffle`` 时还会调用 ``aiter_moe_shfl_weight``，那是另一套
+        布局，叠加上去单跑仍然是乱码。Triton 回退继续吃未重排的打包。
+        """
+        backend = getattr(self.moe, "moe_backend", "auto")
+        from vllm_hcu.model_executor.layers.fused_moe.deepep_runtime import (
+            slimquant_w4a8_uses_deepep_auto,
+        )
+
+        if backend == "triton" or slimquant_w4a8_uses_deepep_auto(self.moe):
+            super().process_weights_after_loading(layer)
+            return
+
+        from vllm_hcu.model_executor.layers.quantization.compressed_tensors_moe_runtime import (
+            prewarm_aiter_w4a8_moe,
+        )
+
+        aiter_config = prewarm_aiter_w4a8_moe(self, layer)
+        if aiter_config is None:
+            super().process_weights_after_loading(layer)
+            return
+
+        if not getattr(layer, "_glm_w4a8_gemm2_shuffled", False):
+            from vllm_hcu.model_executor.layers.quantization.kimi_k3_w4a8 import (
+                repack_and_shuffle_w4a8,
             )
 
-            aiter_config = prewarm_aiter_w4a8_moe(self, layer)
-            if aiter_config is not None:
-                for name in ("w13_weight", "w2_weight"):
-                    parameter = getattr(layer, name)
-                    parameter.data.copy_(
-                        repack_slimquant_w4a8_for_aiter(parameter.data)
-                    )
-                layer._glm_w4a8_aiter_regrouped = True
+            for name in ("w13_weight", "w2_weight"):
+                parameter = getattr(layer, name)
+                parameter.data.copy_(repack_and_shuffle_w4a8(parameter.data))
+            layer._glm_w4a8_gemm2_shuffled = True
 
+        # 同一份 config 会被父类和 forward 再次取到。关掉通用 shuffle 后，
+        # kernel 直接读 gemm2 布局，不再按 aiter_moe_shfl_weight 解释。
+        if getattr(aiter_config, "need_shuffle", False):
+            aiter_config.need_shuffle = False
         super().process_weights_after_loading(layer)
 
 
