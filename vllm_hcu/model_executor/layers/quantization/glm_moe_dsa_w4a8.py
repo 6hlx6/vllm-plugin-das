@@ -22,6 +22,7 @@ from vllm_hcu.model_executor.layers.quantization.glm_channel_int4 import (
     convert_compressed_tensors_int4_to_slimquant,
     is_glm_channel_int4_w4a8,
     is_glm_moe_dsa_model,
+    repack_slimquant_w4a8_for_aiter,
 )
 from vllm_hcu.model_executor.layers.quantization.slimquant_w4a8 import (
     SlimQuantW4A8Int8AiterMoEMethod,
@@ -69,6 +70,32 @@ class GlmMoeDsaW4A8MoEMethod(SlimQuantW4A8Int8AiterMoEMethod):
             _wrap_checkpoint_loader(getattr(layer, name), scale=False)
         for name in ("w13_weight_scale", "w2_weight_scale"):
             _wrap_checkpoint_loader(getattr(layer, name), scale=True)
+
+    def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+        # The checkpoint loader leaves each expert in SlimQuant's packed
+        # high-nibble-first representation.  Before the shared SlimQuant
+        # post-load path probes AITER, regroup the eight INT4 values required
+        # by the W4A8 moe_c layout.  The shared path then performs at most one
+        # AITER layout shuffle.  Do not apply this transformation to the
+        # explicit Triton fallback, which expects the native packed order.
+        if (
+            getattr(self.moe, "moe_backend", "auto") != "triton"
+            and not getattr(layer, "_glm_w4a8_aiter_regrouped", False)
+        ):
+            from vllm_hcu.model_executor.layers.quantization.compressed_tensors_moe_runtime import (
+                prewarm_aiter_w4a8_moe,
+            )
+
+            aiter_config = prewarm_aiter_w4a8_moe(self, layer)
+            if aiter_config is not None:
+                for name in ("w13_weight", "w2_weight"):
+                    parameter = getattr(layer, name)
+                    parameter.data.copy_(
+                        repack_slimquant_w4a8_for_aiter(parameter.data)
+                    )
+                layer._glm_w4a8_aiter_regrouped = True
+
+        super().process_weights_after_loading(layer)
 
 
 class GlmMoeDsaChannelW4A8Config(CompressedTensorsConfig):

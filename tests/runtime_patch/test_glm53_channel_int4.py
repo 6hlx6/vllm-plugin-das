@@ -12,6 +12,7 @@ from vllm_hcu.model_executor.layers.quantization.glm_channel_int4 import (
     is_glm_channel_int4_w4a8,
     is_shared_indexer_layer,
     normalize_routed_expert_checkpoint_name,
+    repack_slimquant_w4a8_for_aiter,
 )
 from vllm_hcu.model_executor.layers.quantization.slimquant_facade import (
     GlmMoeDsaW4A8Facade,
@@ -91,6 +92,15 @@ def test_compressed_tensors_int4_matches_slimquant_nibbles() -> None:
     assert converted.dtype == torch.int8
     assert tuple(converted.shape) == (2, 4)
     assert torch.equal(_unpack_slimquant_int4(converted), values)
+
+
+def test_aiter_w4a8_repack_regroups_eight_nibbles() -> None:
+    # SlimQuant bytes encode [0,1], [2,3], [4,5], [6,7].
+    packed = torch.tensor(
+        [[0x01, 0x23, 0x45, 0x67]], dtype=torch.uint8
+    ).view(torch.int8)
+    repacked = repack_slimquant_w4a8_for_aiter(packed)
+    assert repacked.tolist() == [[0x04, 0x15, 0x26, 0x37]]
 
 
 def test_int4_converter_rejects_unpacked_storage() -> None:

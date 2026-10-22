@@ -17,6 +17,37 @@ import torch
 _INT4_PACK_FACTOR = 8
 
 
+def repack_slimquant_w4a8_for_aiter(weight: torch.Tensor) -> torch.Tensor:
+    """Regroup high-nibble-first packed INT4 bytes for AITER W4A8.
+
+    ``convert_compressed_tensors_int4_to_slimquant`` fixes the nibble order
+    used by the checkpoint.  AITER's W4A8 MoE layout additionally groups eight
+    logical INT4 values as ``[0..3]`` in the high nibbles and ``[4..7]`` in
+    the low nibbles.  This conversion is deliberately separate from the
+    checkpoint loader so it is applied once to the rank-3 expert tensor after
+    all experts have been assembled.
+    """
+    if weight.dtype != torch.int8 or weight.ndim < 1 or weight.shape[-1] <= 0:
+        raise ValueError(
+            "AITER W4A8 repack expects a non-empty int8 packed tensor, "
+            f"got dtype={weight.dtype} shape={tuple(weight.shape)}."
+        )
+
+    packed_u8 = weight.contiguous().view(torch.uint8)
+    nibbles = torch.stack(
+        ((packed_u8 >> 4) & 0x0F, packed_u8 & 0x0F), dim=-1
+    ).reshape(*packed_u8.shape[:-1], -1)
+    if nibbles.shape[-1] % 8:
+        raise ValueError(
+            "AITER W4A8 repack requires the logical INT4 dimension to be "
+            f"divisible by 8, got shape={tuple(weight.shape)}."
+        )
+
+    blocks = nibbles.reshape(*packed_u8.shape[:-1], -1, 8)
+    repacked = ((blocks[..., :4] << 4) | blocks[..., 4:]).reshape_as(packed_u8)
+    return repacked.contiguous().view(torch.int8)
+
+
 def is_glm_moe_dsa_model(hf_config: Any) -> bool:
     """当前配置是否是 GLM MoE DSA。"""
     if getattr(hf_config, "model_type", None) == "glm_moe_dsa":
