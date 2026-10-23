@@ -28,6 +28,14 @@ from vllm_hcu.model_executor.layers.quantization.slimquant_w4a8 import (
 )
 
 
+def _disable_generic_w4a8_shuffle(config: object) -> None:
+    """gemm2 已经是最终布局，不能再要求通用 weight/scale shuffle。"""
+    if getattr(config, "need_shuffle", False):
+        config.need_shuffle = False
+    if getattr(config, "need_shuffle_scale", False):
+        config.need_shuffle_scale = False
+
+
 def _wrap_checkpoint_loader(param: torch.nn.Parameter, *, scale: bool) -> None:
     """在原 expert loader 之前完成打包转换和 scale 类型对齐。"""
     original = param.weight_loader
@@ -106,10 +114,9 @@ class GlmMoeDsaW4A8MoEMethod(SlimQuantW4A8Int8AiterMoEMethod):
                 parameter.data.copy_(repack_and_shuffle_w4a8(parameter.data))
             layer._glm_w4a8_gemm2_shuffled = True
 
-        # 同一份 config 会被父类和 forward 再次取到。关掉通用 shuffle 后，
-        # kernel 直接读 gemm2 布局，不再按 aiter_moe_shfl_weight 解释。
-        if getattr(aiter_config, "need_shuffle", False):
-            aiter_config.need_shuffle = False
+        # 预热拿到的是 M=1 的配置。关掉通用 shuffle，父类才会按 gemm2
+        # 布局登记权重，而不会再调用 aiter_moe_shfl_weight。
+        _disable_generic_w4a8_shuffle(aiter_config)
         super().process_weights_after_loading(layer)
 
 

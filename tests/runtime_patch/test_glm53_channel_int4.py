@@ -110,7 +110,12 @@ def test_glm_aiter_path_uses_gemm2_shuffle_without_generic_shuffle() -> None:
         "vllm_hcu/model_executor/layers/quantization/glm_moe_dsa_w4a8.py"
     ).read_text(encoding="utf-8")
     assert "repack_and_shuffle_w4a8" in source
-    assert "aiter_config.need_shuffle = False" in source
+    assert "_disable_generic_w4a8_shuffle" in source
+    runtime = Path(
+        "vllm_hcu/model_executor/layers/quantization/compressed_tensors_moe_runtime.py"
+    ).read_text(encoding="utf-8")
+    assert "_glm_w4a8_gemm2_shuffled" in runtime
+    assert "aiter_config.need_shuffle = False" in runtime
 
 
 def test_int4_converter_rejects_unpacked_storage() -> None:
