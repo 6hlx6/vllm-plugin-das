@@ -20,10 +20,10 @@ from vllm_hcu.model_executor.layers.quantization.slimquant_facade import (
 
 
 def _pack_compressed_tensors_int4(values: torch.Tensor) -> torch.Tensor:
-    """按 compressed-tensors 的低位优先规则把有符号 INT4 打进 int32。"""
+    """按 compressed-tensors 的 uint4b8（数值加 8）、低位优先规则打进 int32。"""
     if values.shape[-1] % 8:
         raise AssertionError("K 必须是 8 的倍数")
-    nibbles = (values.to(torch.int32) & 0xF).reshape(*values.shape[:-1], -1, 8)
+    nibbles = ((values.to(torch.int32) + 8) & 0xF).reshape(*values.shape[:-1], -1, 8)
     packed = torch.zeros(
         *values.shape[:-1],
         values.shape[-1] // 8,
@@ -121,6 +121,21 @@ def test_glm_aiter_path_uses_gemm2_shuffle_without_generic_shuffle() -> None:
 def test_int4_converter_rejects_unpacked_storage() -> None:
     with pytest.raises(ValueError, match="int32"):
         convert_compressed_tensors_int4_to_slimquant(torch.zeros(2, 4, dtype=torch.int8))
+
+
+def test_expert_scale_loader_converts_to_slimquant_canonical() -> None:
+    from vllm_hcu.model_executor.layers.quantization.glm_moe_dsa_w4a8 import (
+        _wrap_checkpoint_loader,
+    )
+
+    loaded = []
+    param = torch.nn.Parameter(torch.ones(2, 1), requires_grad=False)
+    param.weight_loader = lambda _param, weight, *args, **kwargs: loaded.append(weight)
+    _wrap_checkpoint_loader(param, scale=True)
+    scale = torch.tensor([[0.5], [0.25]], dtype=torch.bfloat16)
+    param.weight_loader(param, scale)
+    assert loaded[0].dtype == torch.float32
+    assert torch.equal(loaded[0], scale.float() / 16.0)
 
 
 def test_glm53_quant_config_selects_mixed_w4a8() -> None:

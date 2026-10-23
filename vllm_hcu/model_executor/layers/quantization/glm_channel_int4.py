@@ -3,9 +3,9 @@
 """GLM-5.3 Channel-INT4 的纯配置判断和权重布局转换。
 
 路由 expert 使用 compressed-tensors 的 pack-quantized：每个 int32 的低位
-开始连续存放 8 个 INT4。现有 W4A8 kernel 吃的是 SlimQuant 布局，每个字节
-高 4 位是偶数 K、低 4 位是奇数 K。这里只做这两种布局之间的转换，以及
-indexer 共享层、checkpoint 张量名的判断。
+开始连续存放 8 个 INT4，按 uint4b8 存储（数值加 8）。现有 W4A8 kernel 吃的是
+SlimQuant 布局，每个字节高 4 位是偶数 K、低 4 位是奇数 K，数值为补码。这里
+只做这两种布局之间的转换，以及 indexer 共享层、checkpoint 张量名的判断。
 """
 
 from __future__ import annotations
@@ -156,8 +156,9 @@ def convert_compressed_tensors_int4_to_slimquant(
 ) -> torch.Tensor:
     """把 compressed-tensors 的 int32 INT4 打包转成 SlimQuant 的 int8 打包。
 
-    输入最后一维是 ``K / 8``。输出最后一维是 ``K / 2``，字节内高 4 位为偶数
-    K、低 4 位为奇数 K，数值仍是 INT4 的补码。
+    输入最后一维是 ``K / 8``，每个 nibble 按 uint4b8 存储（数值加 8）。输出
+    最后一维是 ``K / 2``，字节内高 4 位为偶数 K、低 4 位为奇数 K，数值转成
+    INT4 的补码。
     """
     if packed.dtype != torch.int32 or packed.ndim < 1 or packed.shape[-1] <= 0:
         raise ValueError(
@@ -170,5 +171,6 @@ def convert_compressed_tensors_int4_to_slimquant(
             "INT4 int32 展开后的字节数不正确："
             f"packed={tuple(packed.shape)} bytes={tuple(raw.shape)}。"
         )
-    swapped = ((raw & 0x0F) << 4) | (raw >> 4)
+    # 交换 nibble 后异或 0x88：每个 nibble 的最高位取反，即减去偏移 8。
+    swapped = (((raw & 0x0F) << 4) | (raw >> 4)) ^ 0x88
     return swapped.view(torch.int8)

@@ -37,13 +37,17 @@ def _disable_generic_w4a8_shuffle(config: object) -> None:
 
 
 def _wrap_checkpoint_loader(param: torch.nn.Parameter, *, scale: bool) -> None:
-    """在原 expert loader 之前完成打包转换和 scale 类型对齐。"""
+    """在原 expert loader 之前完成打包转换和 scale 换算。
+
+    compressed-tensors 的 scale 对应带符号 INT4 的真实值。HIPC/AITER 按高
+    nibble 读出的是 16 倍的值，SlimQuant 的规范 scale 因此要先除以 16；
+    Triton 回退在调用处再乘回 16。
+    """
     original = param.weight_loader
 
     def loader(loaded_param, loaded_weight, *args, **kwargs):
         if scale:
-            if loaded_weight.dtype != loaded_param.dtype:
-                loaded_weight = loaded_weight.to(dtype=loaded_param.dtype)
+            loaded_weight = loaded_weight.to(dtype=loaded_param.dtype) / 16.0
         elif loaded_weight.dtype == torch.int32:
             loaded_weight = convert_compressed_tensors_int4_to_slimquant(
                 loaded_weight
