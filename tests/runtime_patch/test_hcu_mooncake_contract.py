@@ -1276,3 +1276,195 @@ def test_final_pp_stage_registers_backbone_and_only_declared_draft_cache(mooncak
     assert worker.registered_layer_names == names
     assert worker.registered_layer_indices == [77, 78]
     assert len(worker.engine.calls) == 1
+
+
+def test_layerwise_switch_defaults_off_and_respects_extra_config(mooncake):
+    disabled = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(kv_connector_extra_config={})
+    )
+    assert mooncake.mooncake_layerwise_enabled(disabled) is False
+    enabled = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(
+            kv_connector_extra_config={"layerwise": True}
+        )
+    )
+    assert mooncake.mooncake_layerwise_enabled(enabled) is True
+    explicit_off = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(
+            kv_connector_extra_config={"layerwise": False}
+        )
+    )
+    assert mooncake.mooncake_layerwise_enabled(explicit_off) is False
+
+
+def test_layerwise_switch_reads_process_env_when_extra_omits_key(mooncake, monkeypatch):
+    cfg = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(kv_connector_extra_config={})
+    )
+    monkeypatch.setenv("VLLM_HCU_MOONCAKE_LAYERWISE", "1")
+    assert mooncake.mooncake_layerwise_enabled(cfg) is True
+    monkeypatch.setenv("VLLM_HCU_MOONCAKE_LAYERWISE", "0")
+    assert mooncake.mooncake_layerwise_enabled(cfg) is False
+    # extra_config still wins over the env var, including an explicit off.
+    forced_off = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(
+            kv_connector_extra_config={"layerwise": False}
+        )
+    )
+    monkeypatch.setenv("VLLM_HCU_MOONCAKE_LAYERWISE", "1")
+    assert mooncake.mooncake_layerwise_enabled(forced_off) is False
+
+
+def test_region_belongs_to_attention_and_indexer(mooncake):
+    attn = mooncake.TransferRegion(
+        layer_name="model.layers.3.self_attn.attn",
+        layer_index=3,
+        base_addr=1,
+        block_len=8,
+        kv_block_len=8,
+    )
+    indexer = mooncake.TransferRegion(
+        layer_name="model.layers.3.indexer",
+        layer_index=3,
+        base_addr=2,
+        block_len=4,
+        kv_block_len=4,
+    )
+    other = mooncake.TransferRegion(
+        layer_name="model.layers.4.self_attn.attn",
+        layer_index=4,
+        base_addr=3,
+        block_len=8,
+        kv_block_len=8,
+    )
+    hook = "model.layers.3.self_attn.attn"
+    assert mooncake._region_belongs_to_layer(attn, hook)
+    assert mooncake._region_belongs_to_layer(indexer, hook)
+    assert not mooncake._region_belongs_to_layer(other, hook)
+
+
+def test_layerwise_alloc_fills_session_that_handshook_first(mooncake):
+    send_meta = mooncake.SendBlockMeta(
+        p_req_id="",
+        transfer_id="xfer-early",
+        local_block_ids=[],
+        ready=asyncio.Event(),
+    )
+    session = {
+        "send_meta": send_meta,
+        "block_ids": [],
+        "epoch": 0,
+        "p_req_id": "",
+        "prefill_done": False,
+    }
+    filled = mooncake._apply_alloc_to_layerwise_sessions(
+        {("xfer-early",): session},
+        {"xfer-early": (3, [[1, 2]], "req-1")},
+    )
+    assert filled is True
+    assert session["block_ids"] == [[1, 2]]
+    assert session["epoch"] == 3
+    assert session["p_req_id"] == "req-1"
+    assert session["prefill_done"] is False
+    # 已经有 block 的 session 保持不变，避免把正在发送的块表换掉。
+    again = mooncake._apply_alloc_to_layerwise_sessions(
+        {("xfer-early",): session},
+        {"xfer-early": (9, [[8]], "other")},
+    )
+    assert again is False
+    assert session["block_ids"] == [[1, 2]]
+
+
+def test_layerwise_notify_url_comes_from_request_params(mooncake):
+    assert mooncake._layerwise_notify_url(None) == ""
+    assert mooncake._layerwise_notify_url({}) == ""
+    assert (
+        mooncake._layerwise_notify_url(
+            {"layerwise_notify_url": "http://127.0.0.1:8001/notify"}
+        )
+        == "http://127.0.0.1:8001/notify"
+    )
+
+
+def test_layerwise_send_group_uses_async_batch_wait(mooncake):
+    class _Event:
+        def __init__(self):
+            self.synced = False
+
+        def synchronize(self):
+            self.synced = True
+
+    class _Stats:
+        def __init__(self):
+            self.records = []
+
+        def record_transfer(self, duration_s, total_bytes, num_descs):
+            self.records.append((total_bytes, num_descs))
+
+        def record_failed_transfer(self):
+            raise AssertionError("grouped send should succeed")
+
+    class _Engine:
+        def __init__(self):
+            self.async_calls = []
+            self.status_calls = []
+
+        def batch_transfer_sync_write(self, session, src, dst, lengths):
+            raise AssertionError("layerwise send must use async batch submit")
+
+        def batch_transfer_async_write(self, session, src, dst, lengths):
+            self.async_calls.append((session, list(src), list(dst), list(lengths)))
+            return 123
+
+        def get_batch_transfer_status(self, batch_ids):
+            self.status_calls.append(list(batch_ids))
+            return 0
+
+    worker = object.__new__(mooncake.MooncakeConnectorWorker)
+    worker.engine = _Engine()
+    worker.xfer_stats = _Stats()
+    event = _Event()
+    ret = worker._send_layer_blocks(
+        event, "10.0.0.8:1", [10, 11], [20, 21], [64, 64]
+    )
+    assert ret == 0
+    assert event.synced is True
+    assert len(worker.engine.async_calls) == 1
+    assert worker.engine.async_calls[0][1:] == ([10, 11], [20, 21], [64, 64])
+    assert worker.engine.status_calls == [[123]]
+    assert mooncake._LAYERWISE_SEND_GROUP == 8
+
+
+def test_layerwise_send_falls_back_to_sync_api(mooncake):
+    class _Event:
+        def synchronize(self):
+            pass
+
+    class _Engine:
+        def __init__(self):
+            self.sync_calls = []
+
+        def batch_transfer_sync_write(self, session, src, dst, lengths):
+            self.sync_calls.append((session, list(src), list(dst), list(lengths)))
+            return 0
+
+    worker = object.__new__(mooncake.MooncakeConnectorWorker)
+    worker.engine = _Engine()
+    worker.xfer_stats = type(
+        "_Stats",
+        (),
+        {
+            "record_transfer": lambda *_args, **_kwargs: None,
+            "record_failed_transfer": lambda *_args, **_kwargs: None,
+        },
+    )()
+    assert worker._send_layer_blocks(
+        _Event(), "10.0.0.8:1", [10], [20], [64]
+    ) == 0
+    assert len(worker.engine.sync_calls) == 1
+
+
+def test_layerwise_notify_is_noop_when_disabled(mooncake):
+    worker = object.__new__(mooncake.MooncakeConnectorWorker)
+    worker.layerwise_enabled = False
+    worker.notify_layer_computed("model.layers.0.self_attn.attn")
