@@ -1083,8 +1083,9 @@ def apply_aiter_w4a8_moe(
                 cache_owner=w1,
                 solution_type="moe_c",
             )
-        # GLM gemm2 权重在加载时已经定稿。不同 M 会重新选出带
-        # need_shuffle 的配置，这里改回和已安装布局一致，避免对不上。
+        # GLM gemm2 weights are finalized at load time. A different M can
+        # select a config that sets need_shuffle; clear it so the config
+        # matches the installed layout.
         if aiter_config is not None and getattr(
             layer, "_glm_w4a8_gemm2_shuffled", False
         ):

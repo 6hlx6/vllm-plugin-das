@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""GLM-5.3 Channel-INT4 的打包转换、AITER gemm2 布局和量化识别。"""
+"""Packing conversion, AITER gemm2 layout, and quant detection for GLM-5.3 channel INT4."""
 
 import sys
 from types import ModuleType, SimpleNamespace
@@ -21,9 +21,9 @@ from vllm_hcu.model_executor.layers.quantization.slimquant_facade import (
 
 
 def _pack_compressed_tensors_int4(values: torch.Tensor) -> torch.Tensor:
-    """按 compressed-tensors 的 uint4b8（数值加 8）、低位优先规则打进 int32。"""
+    """Pack into int32 with compressed-tensors uint4b8 (value plus 8), low nibble first."""
     if values.shape[-1] % 8:
-        raise AssertionError("K 必须是 8 的倍数")
+        raise AssertionError("K must be a multiple of 8")
     nibbles = ((values.to(torch.int32) + 8) & 0xF).reshape(*values.shape[:-1], -1, 8)
     packed = torch.zeros(
         *values.shape[:-1],

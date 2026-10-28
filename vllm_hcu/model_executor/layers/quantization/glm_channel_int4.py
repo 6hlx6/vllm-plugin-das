@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""GLM-5.3 Channel-INT4 的纯配置判断和权重布局转换。
+"""Config checks and weight-layout conversion for GLM-5.3 channel INT4.
 
-路由 expert 使用 compressed-tensors 的 pack-quantized：每个 int32 的低位
-开始连续存放 8 个 INT4，按 uint4b8 存储（数值加 8）。现有 W4A8 kernel 吃的是
-SlimQuant 布局，每个字节高 4 位是偶数 K、低 4 位是奇数 K，数值为补码。这里
-只做这两种布局之间的转换、AITER gemm2 布局重排，以及 checkpoint 张量名的判断。
+Routed experts use compressed-tensors pack-quantized storage: eight INT4
+values are packed into each int32 from the low bits, stored as uint4b8
+(value plus 8). Existing W4A8 kernels consume the SlimQuant layout, where
+the high nibble of each byte is even K, the low nibble is odd K, and the
+values are two's complement. This module only converts between those two
+layouts, applies the AITER gemm2 reorder, and classifies checkpoint tensor
+names.
 """
 
 from __future__ import annotations
@@ -53,11 +56,12 @@ def repack_and_shuffle_w4a8_gemm2(
     weight: torch.Tensor,
     shuffle_fn: Callable[[torch.Tensor], torch.Tensor] | None = None,
 ) -> torch.Tensor:
-    """把 SlimQuant 打包的 ``[E, N, K/2]`` expert 转成 AITER moe_c 的 gemm2 布局。
+    """Convert SlimQuant-packed ``[E, N, K/2]`` experts to the AITER moe_c gemm2 layout.
 
-    先做 8-nibble 重排，再对每个 expert 调用 AITER 的
-    ``w4a8_moe_layout_shuffle_gemm2``。结果是一次性的破坏性转换，只能在加载
-    时做一次，不能在 forward 里重复做。
+    Regroup eight nibbles first, then call AITER's
+    ``w4a8_moe_layout_shuffle_gemm2`` on each expert. The result is a one-shot
+    destructive conversion. It must run once at load time and must not run
+    again in forward.
     """
     if weight.ndim != 3 or weight.dtype != torch.int8:
         raise ValueError(
@@ -71,9 +75,9 @@ def repack_and_shuffle_w4a8_gemm2(
             )
         except ImportError as exc:
             raise RuntimeError(
-                "GLM-5.3 W4A8 AITER 路径需要 "
-                "aiter.ops.shuffle.w4a8_moe_layout_shuffle_gemm2；当前 AITER "
-                "没有提供，可改用 --moe-backend triton。"
+                "GLM-5.3 W4A8 AITER path requires "
+                "aiter.ops.shuffle.w4a8_moe_layout_shuffle_gemm2; this AITER "
+                "build does not provide it. Use --moe-backend triton instead."
             ) from exc
 
     repacked = repack_slimquant_w4a8_for_aiter(weight).view(torch.uint8)
@@ -84,7 +88,7 @@ def repack_and_shuffle_w4a8_gemm2(
 
 
 def is_glm_moe_dsa_model(hf_config: Any) -> bool:
-    """当前配置是否是 GLM MoE DSA。"""
+    """Return whether the config is a GLM MoE DSA model."""
     if getattr(hf_config, "model_type", None) == "glm_moe_dsa":
         return True
     architectures = getattr(hf_config, "architectures", None) or ()
@@ -92,7 +96,7 @@ def is_glm_moe_dsa_model(hf_config: Any) -> bool:
 
 
 def is_glm_channel_int4_w4a8(hf_quant_cfg: dict[str, Any] | None) -> bool:
-    """量化配置是否同时包含 channel INT4 expert 和 channel INT8 Linear。"""
+    """Return whether the quant config mixes channel INT4 experts and channel INT8 linears."""
     if not isinstance(hf_quant_cfg, dict):
         return False
     if hf_quant_cfg.get("quant_method") != "compressed-tensors":
@@ -136,12 +140,13 @@ def normalize_routed_expert_checkpoint_name(
     name: str,
     experts_use_unpacked_weight: bool,
 ) -> str | None:
-    """把路由 expert 的打包张量名改成现有 loader 能对上的名字。
+    """Rewrite packed routed-expert tensor names so the existing loader can match them.
 
-    只在 expert 参数名是 ``w13_weight`` 而不是 ``w13_weight_packed`` 时生效：
-    ``weight_packed`` 改成 ``weight``，``weight_shape`` 返回 None 让调用方跳过。
-    参数本身就是 packed 命名（例如 compressed-tensors W4A16）时名字原样返回，
-    它们的 ``weight_shape`` 也照常加载。
+    Applied only when expert parameters are named ``w13_weight`` rather than
+    ``w13_weight_packed``: ``weight_packed`` becomes ``weight``, and
+    ``weight_shape`` returns None so the caller skips it. Parameters that are
+    already packed-named (for example compressed-tensors W4A16) are returned
+    unchanged, and their ``weight_shape`` tensors are still loaded.
     """
     if ".mlp.experts." not in name or not experts_use_unpacked_weight:
         return name
@@ -155,23 +160,24 @@ def normalize_routed_expert_checkpoint_name(
 def convert_compressed_tensors_int4_to_slimquant(
     packed: torch.Tensor,
 ) -> torch.Tensor:
-    """把 compressed-tensors 的 int32 INT4 打包转成 SlimQuant 的 int8 打包。
+    """Convert compressed-tensors int32 INT4 packing to SlimQuant int8 packing.
 
-    输入最后一维是 ``K / 8``，每个 nibble 按 uint4b8 存储（数值加 8）。输出
-    最后一维是 ``K / 2``，字节内高 4 位为偶数 K、低 4 位为奇数 K，数值转成
-    INT4 的补码。
+    The input's last dimension is ``K / 8``. Each nibble is uint4b8 (value
+    plus 8). The output's last dimension is ``K / 2``: the high nibble is
+    even K, the low nibble is odd K, and the values are INT4 two's complement.
     """
     if packed.dtype != torch.int32 or packed.ndim < 1 or packed.shape[-1] <= 0:
         raise ValueError(
-            "compressed-tensors INT4 权重必须是最后一维为正的 int32，"
-            f"收到 dtype={packed.dtype} shape={tuple(packed.shape)}。"
+            "compressed-tensors INT4 weights must be int32 with a positive "
+            f"last dimension, got dtype={packed.dtype} shape={tuple(packed.shape)}."
         )
     raw = packed.contiguous().view(torch.uint8)
     if raw.shape[-1] != packed.shape[-1] * (_INT4_PACK_FACTOR // 2):
         raise ValueError(
-            "INT4 int32 展开后的字节数不正确："
-            f"packed={tuple(packed.shape)} bytes={tuple(raw.shape)}。"
+            "INT4 int32 unpacked byte count is wrong: "
+            f"packed={tuple(packed.shape)} bytes={tuple(raw.shape)}."
         )
-    # 交换 nibble 后异或 0x88：每个 nibble 的最高位取反，即减去偏移 8。
+    # Swap nibbles, then XOR 0x88: flip the high bit of each nibble,
+    # which subtracts the uint4b8 bias of 8.
     swapped = (((raw & 0x0F) << 4) | (raw >> 4)) ^ 0x88
     return swapped.view(torch.int8)

@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""GLM MoE DSA 的 channel INT4 expert 与 channel INT8 Linear 混合量化。
+"""Mixed quantization for GLM MoE DSA: channel INT4 experts and channel INT8 linears.
 
-checkpoint 里路由 expert（含 MTP）是 compressed-tensors pack-quantized
-INT4，scale 为 BF16 per-channel，激活动态 per-token INT8。其余 Linear 仍走
-compressed-tensors 的 channel INT8。发布配置的 INT4 正则可能漏掉 MTP 层，
-因此只要整份配置属于这种混合方案，所有 RoutedExperts 都按 INT4 加载。
+Routed experts in the checkpoint, including MTP, are compressed-tensors
+pack-quantized INT4 with BF16 per-channel scales and dynamic per-token INT8
+activations. Other linears stay on compressed-tensors channel INT8. The
+published INT4 regex can miss MTP layers, so every RoutedExperts module is
+loaded as INT4 when the config as a whole is this mixed scheme.
 """
 
 from __future__ import annotations
@@ -30,7 +31,7 @@ from vllm_hcu.model_executor.layers.quantization.slimquant_w4a8 import (
 
 
 def _disable_generic_w4a8_shuffle(config: object) -> None:
-    """gemm2 已经是最终布局，不能再要求通用 weight/scale shuffle。"""
+    """gemm2 is already the final layout, so skip the generic weight/scale shuffle."""
     if getattr(config, "need_shuffle", False):
         config.need_shuffle = False
     if getattr(config, "need_shuffle_scale", False):
@@ -38,11 +39,12 @@ def _disable_generic_w4a8_shuffle(config: object) -> None:
 
 
 def _wrap_checkpoint_loader(param: torch.nn.Parameter, *, scale: bool) -> None:
-    """在原 expert loader 之前完成打包转换和 scale 换算。
+    """Convert packing and rescale before the original expert loader runs.
 
-    compressed-tensors 的 scale 对应带符号 INT4 的真实值。HIPC/AITER 按高
-    nibble 读出的是 16 倍的值，SlimQuant 的规范 scale 因此要先除以 16；
-    Triton 回退在调用处再乘回 16。
+    compressed-tensors scales match the real signed INT4 values. HIPC/AITER
+    read the high nibble as 16 times that value, so the SlimQuant canonical
+    scale is the checkpoint scale divided by 16. The Triton fallback
+    multiplies by 16 again at the call site.
     """
     original = param.weight_loader
 
@@ -59,7 +61,7 @@ def _wrap_checkpoint_loader(param: torch.nn.Parameter, *, scale: bool) -> None:
 
 
 class GlmMoeDsaW4A8MoEMethod(SlimQuantW4A8Int8AiterMoEMethod):
-    """加载 packed INT4 expert，计算仍复用 SlimQuant W4A8。"""
+    """Load packed INT4 experts and keep computation on SlimQuant W4A8."""
 
     def create_weights(
         self,
@@ -84,13 +86,14 @@ class GlmMoeDsaW4A8MoEMethod(SlimQuantW4A8Int8AiterMoEMethod):
             _wrap_checkpoint_loader(getattr(layer, name), scale=True)
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
-        """把 expert 收成 AITER W4A8 的 gemm2 布局，并避免再做通用 shuffle。
+        """Fold experts into the AITER W4A8 gemm2 layout and skip the generic shuffle.
 
-        只做 8-nibble 重排仍然是 SlimQuant 的逐对字节序。AITER moe_c 要的是
-        这次重排之后再走 ``w4a8_moe_layout_shuffle_gemm2``。父类在
-        ``need_shuffle`` 时还会调用 ``aiter_moe_shfl_weight``，那是另一套
-        布局，叠加上去单跑仍然是乱码。Triton (BoltOps) 和 DeepEP 路径继续吃
-        未重排的 SlimQuant 打包。
+        An 8-nibble regroup alone is still SlimQuant's pairwise byte order.
+        AITER moe_c expects that regroup followed by
+        ``w4a8_moe_layout_shuffle_gemm2``. When ``need_shuffle`` is set, the
+        parent also calls ``aiter_moe_shfl_weight``, which is a different
+        layout; stacking the two still yields garbage on a single run.
+        Triton (BoltOps) and DeepEP keep the unshuffled SlimQuant packing.
         """
         backend = getattr(self.moe, "moe_backend", "auto")
         from vllm_hcu.model_executor.layers.fused_moe.deepep_runtime import (
@@ -116,14 +119,15 @@ class GlmMoeDsaW4A8MoEMethod(SlimQuantW4A8Int8AiterMoEMethod):
                 parameter.data.copy_(repack_and_shuffle_w4a8_gemm2(parameter.data))
             layer._glm_w4a8_gemm2_shuffled = True
 
-        # 预热拿到的是 M=1 的配置。关掉通用 shuffle，父类才会按 gemm2
-        # 布局登记权重，而不会再调用 aiter_moe_shfl_weight。
+        # Prewarm returns the M=1 config. Clear the generic shuffle so the
+        # parent registers the gemm2 layout and does not call
+        # aiter_moe_shfl_weight.
         _disable_generic_w4a8_shuffle(aiter_config)
         super().process_weights_after_loading(layer)
 
 
 class GlmMoeDsaChannelW4A8Config(CompressedTensorsConfig):
-    """GLM MoE DSA 混合量化：expert 走 INT4，其余 Linear 走原 INT8。"""
+    """GLM MoE DSA mixed quant: INT4 experts, original INT8 for other linears."""
 
     @classmethod
     def get_name(cls) -> str:
@@ -134,7 +138,7 @@ class GlmMoeDsaChannelW4A8Config(CompressedTensorsConfig):
         parsed = super().from_config(config)
         if type(parsed) is cls:
             return parsed
-        # 父类若写死返回基类，把已解析字段接到当前子类上。
+        # If the parent hardcodes the base class, copy parsed fields onto this subclass.
         instance = cls.__new__(cls)
         instance.__dict__.update(parsed.__dict__)
         return instance

@@ -141,7 +141,7 @@ class SlimQuantW4A8Facade(_SlimQuantFacade):
 
 
 class GlmMoeDsaW4A8Facade(_SlimQuantFacade):
-    """GLM MoE DSA channel INT4 expert 的自动量化入口。"""
+    """Auto quantization entry for GLM MoE DSA channel INT4 experts."""
 
     _registry_name = "glm_moe_dsa_w4a8"
     _implementation_module = (
