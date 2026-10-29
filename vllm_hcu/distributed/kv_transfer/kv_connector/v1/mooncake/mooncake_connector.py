@@ -74,7 +74,8 @@ from vllm.v1.request import RequestStatus
 from vllm.v1.worker.block_table import BlockTable
 from vllm.v1.worker.utils import select_common_block_size
 
-logger = init_logger(__name__)
+# Use vLLM's configured logger hierarchy.
+logger = init_logger("vllm." + __name__)
 
 _CMPL_UUID_RE = re.compile(
     r"cmpl-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
@@ -1136,6 +1137,13 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         """Get the finished recving and sending requests."""
         assert self.connector_worker is not None
         return self.connector_worker.get_finished()
+
+    def bind_connector_metadata(self, connector_metadata: KVConnectorMetadata) -> None:
+        """Initialize layerwise state before attention callbacks run."""
+        super().bind_connector_metadata(connector_metadata)
+        assert isinstance(connector_metadata, MooncakeConnectorMetadata)
+        if self.connector_worker is not None and self.connector_worker.layerwise_enabled:
+            self.connector_worker._begin_layerwise_forward(connector_metadata)
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         assert self.connector_worker is not None
@@ -3476,8 +3484,6 @@ class MooncakeConnectorWorker:
                 assert not send_meta.ready.is_set()
 
     def start_load_kv(self, metadata: MooncakeConnectorMetadata):
-        if self.layerwise_enabled:
-            self._begin_layerwise_forward(metadata)
         if not self.is_kv_producer and metadata.reqs_to_recv:
             asyncio.run_coroutine_threadsafe(
                 self._start_load_kv(metadata.reqs_to_recv), self.receiver_loop

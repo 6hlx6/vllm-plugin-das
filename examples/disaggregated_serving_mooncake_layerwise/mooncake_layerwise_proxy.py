@@ -13,6 +13,7 @@ import argparse
 import copy
 import json
 import threading
+import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
@@ -39,7 +40,10 @@ def _run_prefill(body: dict, transfer_id: str, request_path: str) -> None:
     """后台跑 Prefill。响应里的 kv 参数只在通知丢失时当作退路。"""
     prefill_body = copy.deepcopy(body)
     prefill_body["max_tokens"] = 1
+    if "max_completion_tokens" in prefill_body:
+        prefill_body["max_completion_tokens"] = 1
     prefill_body["stream"] = False
+    prefill_body.pop("stream_options", None)
     params = dict(prefill_body.get("kv_transfer_params") or {})
     # 用 Prefill 机器的地址，避免 Worker 在容器里访问不到 127.0.0.1 上的代理。
     # The notify endpoint may run on a different host than the prefiller.
@@ -72,6 +76,7 @@ def _run_prefill(body: dict, transfer_id: str, request_path: str) -> None:
     if slot is not None:
         slot["prefill"] = result
         slot["prefill_done"].set()
+        slot["ready"].set()
 
 
 def _decode_params_from_notify(payload: dict, transfer_id: str) -> dict:
@@ -94,6 +99,30 @@ def _decode_params_from_prefill(prefill: dict, transfer_id: str) -> dict | None:
     merged["do_remote_decode"] = False
     merged["transfer_id"] = params.get("transfer_id") or transfer_id
     return merged
+
+
+def _prefill_failed(prefill: dict) -> bool:
+    status = prefill.get("status", 200)
+    return bool(prefill.get("error")) or not 200 <= status < 300
+
+
+def _wait_for_prefill(slot: dict, transfer_id: str) -> bool:
+    """Wake for a notify, an upstream error, or usable fallback metadata."""
+    deadline = time.monotonic() + _NOTIFY_TIMEOUT_S
+    while True:
+        slot["ready"].clear()
+        if slot["notify"].is_set():
+            return True
+        if slot["prefill_done"].is_set():
+            prefill = slot.get("prefill") or {}
+            if _prefill_failed(prefill) or _decode_params_from_prefill(
+                prefill, transfer_id
+            ):
+                return False
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        slot["ready"].wait(remaining)
 
 
 def _forward_decode(body: dict, params: dict, request_path: str):
@@ -159,6 +188,7 @@ class _Handler(BaseHTTPRequestHandler):
             if slot is not None and slot.get("payload") is None:
                 slot["payload"] = data
                 slot["notify"].set()
+                slot["ready"].set()
             self._write(204, b"", "text/plain")
             return
         if path not in ("/v1/chat/completions", "/v1/completions"):
@@ -171,18 +201,28 @@ class _Handler(BaseHTTPRequestHandler):
         slot = {
             "notify": threading.Event(),
             "prefill_done": threading.Event(),
+            "ready": threading.Event(),
             "payload": None,
             "prefill": None,
         }
         with _PENDING_LOCK:
             _PENDING[transfer_id] = slot
+        try:
+            self._serve_request(body, path, transfer_id, slot)
+        finally:
+            with _PENDING_LOCK:
+                _PENDING.pop(transfer_id, None)
+
+    def _serve_request(
+        self, body: dict, path: str, transfer_id: str, slot: dict
+    ) -> None:
         threading.Thread(
             target=_run_prefill,
             args=(body, transfer_id, path),
             daemon=True,
             name=f"prefill-{transfer_id[:8]}",
         ).start()
-        notified = slot["notify"].wait(_NOTIFY_TIMEOUT_S)
+        notified = _wait_for_prefill(slot, transfer_id)
         params = None
         if notified and slot.get("payload"):
             params = _decode_params_from_notify(slot["payload"], transfer_id)
@@ -192,11 +232,21 @@ class _Handler(BaseHTTPRequestHandler):
             )
         else:
             slot["prefill_done"].wait()
-            params = _decode_params_from_prefill(slot.get("prefill") or {}, transfer_id)
+            prefill = slot.get("prefill") or {}
+            if _prefill_failed(prefill):
+                message = json.dumps(
+                    {"error": "Prefill request failed", "prefill": prefill}
+                ).encode("utf-8")
+                self._write(502, message, "application/json")
+                return
+            params = _decode_params_from_prefill(prefill, transfer_id)
             print("[layerwise-proxy] fallback after prefill transfer_id=" f"{transfer_id}")
         if not params or not params.get("remote_engine_id"):
             message = json.dumps(
-                {"error": "layerwise proxy did not get prefiller engine id"}
+                {
+                    "error": "layerwise proxy did not get prefiller engine id",
+                    "prefill": slot.get("prefill"),
+                }
             ).encode("utf-8")
             self._write(502, message, "application/json")
             return
@@ -214,8 +264,6 @@ class _Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             content = json.dumps({"error": str(exc)}).encode("utf-8")
             self._write(502, content, "application/json")
-        with _PENDING_LOCK:
-            _PENDING.pop(transfer_id, None)
 
 
 def main() -> None:
