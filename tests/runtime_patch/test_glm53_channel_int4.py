@@ -143,6 +143,20 @@ def test_gemm2_repack_rejects_non_expert_rank() -> None:
         )
 
 
+def test_expert_int4_after_ignored_dense_layers_selects_w4a8() -> None:
+    config = _glm_hf_config()
+    quant = _quant_config()
+    quant["config_groups"]["group_int4"]["targets"] = [
+        "re:^model\\.layers\\.([3-9]|[1-9]\\d+)\\.mlp\\.experts.*"
+    ]
+    quant["ignore"] = ["re:^model\\.layers\\.[0-2]\\..*", "lm_head"]
+    assert is_glm_channel_int4_w4a8(quant) is True
+    assert (
+        GlmMoeDsaW4A8Facade.override_quantization_method(quant, None, config)
+        == "glm_moe_dsa_w4a8"
+    )
+
+
 def test_non_expert_int4_and_ignored_experts_do_not_select_w4a8() -> None:
     config = _glm_hf_config()
     quant = _quant_config()

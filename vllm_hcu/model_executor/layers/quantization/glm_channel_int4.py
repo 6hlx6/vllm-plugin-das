@@ -96,14 +96,9 @@ def is_glm_moe_dsa_model(hf_config: Any) -> bool:
     return "GlmMoeDsaForCausalLM" in architectures
 
 
-# Names a published expert target must match. Shared-expert linears do not.
-_ROUTED_EXPERT_PROBES = (
-    "model.layers.0.mlp.experts",
-    "model.layers.0.mlp.experts.0.gate_proj",
-    "model.layers.0.mlp.experts.0.up_proj",
-    "model.layers.0.mlp.experts.0.down_proj",
-)
-_ROUTED_EXPERT_PREFIX = _ROUTED_EXPERT_PROBES[0]
+# GLM MoE keeps the first layers dense. Probes must include a later expert
+# layer, because an INT4 regex or ignore entry often skips layer 0.
+_EXPERT_PROBE_LAYER_INDEXES = range(8)
 _MTP_BLOCK_MARKER = ".mtp_block."
 # Backbone and MTP experts share this shape. The index is what a published
 # regex often fails to extend past ``num_hidden_layers``.
@@ -161,19 +156,34 @@ def _group_targets(group: dict[str, Any]) -> list[str]:
     return [target for target in targets if isinstance(target, str)]
 
 
-def _targets_cover_routed_experts(targets: list[str]) -> bool:
-    """Return whether any target selects the routed-expert stack."""
+def _routed_expert_probes() -> list[tuple[str, str]]:
+    """Return ``(module_prefix, match_name)`` for early routed-expert layers."""
+    probes = []
+    for index in _EXPERT_PROBE_LAYER_INDEXES:
+        prefix = f"model.layers.{index}.mlp.experts"
+        probes.append((prefix, prefix))
+        for proj_name in ("gate_proj", "up_proj", "down_proj"):
+            probes.append((prefix, f"{prefix}.0.{proj_name}"))
+    return probes
+
+
+def _targets_cover_routed_experts(targets: list[str], ignore: Any = None) -> bool:
+    """Return whether an INT4 target selects a routed expert that is not ignored.
+
+    Layer 0 can be dense or ignored while later expert layers stay INT4. One
+    such layer is enough to select this method. Shared experts and attention
+    projections do not match these probes.
+    """
     from vllm.model_executor.layers.quantization.utils.config_utils import (
         is_equal_or_regex_match,
     )
 
-    for target in targets:
-        if target == "RoutedExperts":
-            return True
-        if any(
-            is_equal_or_regex_match(probe, target) for probe in _ROUTED_EXPERT_PROBES
-        ):
-            return True
+    for module_prefix, probe in _routed_expert_probes():
+        if _ignore_covers_prefix(module_prefix, ignore):
+            continue
+        for target in targets:
+            if target == "RoutedExperts" or is_equal_or_regex_match(probe, target):
+                return True
     return False
 
 
@@ -194,9 +204,9 @@ def _ignore_covers_prefix(prefix: str, ignore: Any, fused_mapping: Any = None) -
 def is_glm_channel_int4_w4a8(hf_quant_cfg: dict[str, Any] | None) -> bool:
     """Return whether the quant config mixes channel INT4 experts and channel INT8 linears.
 
-    The INT4 group must target routed experts, and those experts must not be
-    listed in ``ignore``. An INT4 group that only covers non-expert layers does
-    not select this method.
+    The INT4 group must target a routed-expert layer that ``ignore`` does not
+    exclude. Early dense layers may be ignored or absent from the INT4 regex.
+    An INT4 group that only covers non-expert layers does not select this method.
     """
     if not isinstance(hf_quant_cfg, dict):
         return False
@@ -205,8 +215,9 @@ def is_glm_channel_int4_w4a8(hf_quant_cfg: dict[str, Any] | None) -> bool:
     groups = hf_quant_cfg.get("config_groups")
     if not isinstance(groups, dict):
         return False
-    has_int4_experts = False
+    int4_targets: list[str] = []
     has_int8 = False
+    ignore = hf_quant_cfg.get("ignore") or []
     for group in groups.values():
         if not isinstance(group, dict):
             continue
@@ -214,16 +225,12 @@ def is_glm_channel_int4_w4a8(hf_quant_cfg: dict[str, Any] | None) -> bool:
         activations = group.get("input_activations") or {}
         group_format = group.get("format") or hf_quant_cfg.get("format")
         if _is_channel_int4_w4a8_scheme(weights, activations, group_format):
-            if _targets_cover_routed_experts(_group_targets(group)):
-                has_int4_experts = True
+            int4_targets.extend(_group_targets(group))
         if _is_channel_int8_scheme(weights, activations):
             has_int8 = True
-    if not (has_int4_experts and has_int8):
+    if not has_int8 or not int4_targets:
         return False
-    return not _ignore_covers_prefix(
-        _ROUTED_EXPERT_PREFIX,
-        hf_quant_cfg.get("ignore") or [],
-    )
+    return _targets_cover_routed_experts(int4_targets, ignore)
 
 
 def _scheme_is_channel_int4(scheme: Any) -> bool:
