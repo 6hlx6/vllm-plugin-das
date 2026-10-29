@@ -13,6 +13,7 @@ names.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from typing import Any
 
@@ -95,8 +96,108 @@ def is_glm_moe_dsa_model(hf_config: Any) -> bool:
     return "GlmMoeDsaForCausalLM" in architectures
 
 
+# Names a published expert target must match. Shared-expert linears do not.
+_ROUTED_EXPERT_PROBES = (
+    "model.layers.0.mlp.experts",
+    "model.layers.0.mlp.experts.0.gate_proj",
+    "model.layers.0.mlp.experts.0.up_proj",
+    "model.layers.0.mlp.experts.0.down_proj",
+)
+_ROUTED_EXPERT_PREFIX = _ROUTED_EXPERT_PROBES[0]
+_MTP_BLOCK_MARKER = ".mtp_block."
+# Backbone and MTP experts share this shape. The index is what a published
+# regex often fails to extend past ``num_hidden_layers``.
+_LAYER_EXPERT_PREFIX = re.compile(
+    r"^(?P<head>.*?layers\.)(?P<idx>\d+)"
+    r"(?P<tail>(?:\.mtp_block)?\.mlp\.experts(?:\..*)?)$"
+)
+
+
+def _quant_field(value: Any, name: str) -> Any:
+    """Read one quantization field from a raw dict or QuantizationArgs."""
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        field = value.get(name)
+    else:
+        field = getattr(value, name, None)
+    return getattr(field, "value", field)
+
+
+def _is_channel_int4_w4a8_scheme(
+    weights: Any,
+    activations: Any,
+    group_format: Any,
+) -> bool:
+    return (
+        _quant_field(weights, "num_bits") == 4
+        and _quant_field(weights, "strategy") == "channel"
+        and _quant_field(weights, "type") == "int"
+        and _quant_field(weights, "symmetric") is True
+        and _quant_field(activations, "num_bits") == 8
+        and _quant_field(activations, "strategy") == "token"
+        and _quant_field(activations, "dynamic") is True
+        and _quant_field(activations, "type") == "int"
+        and getattr(group_format, "value", group_format) == "pack-quantized"
+    )
+
+
+def _is_channel_int8_scheme(weights: Any, activations: Any) -> bool:
+    return (
+        _quant_field(weights, "num_bits") == 8
+        and _quant_field(weights, "strategy") == "channel"
+        and _quant_field(weights, "type") == "int"
+        and _quant_field(activations, "num_bits") == 8
+        and _quant_field(activations, "strategy") == "token"
+        and _quant_field(activations, "dynamic") is True
+        and _quant_field(activations, "type") == "int"
+    )
+
+
+def _group_targets(group: dict[str, Any]) -> list[str]:
+    targets = group.get("targets") or []
+    if not isinstance(targets, list):
+        return []
+    return [target for target in targets if isinstance(target, str)]
+
+
+def _targets_cover_routed_experts(targets: list[str]) -> bool:
+    """Return whether any target selects the routed-expert stack."""
+    from vllm.model_executor.layers.quantization.utils.config_utils import (
+        is_equal_or_regex_match,
+    )
+
+    for target in targets:
+        if target == "RoutedExperts":
+            return True
+        if any(
+            is_equal_or_regex_match(probe, target) for probe in _ROUTED_EXPERT_PROBES
+        ):
+            return True
+    return False
+
+
+def _ignore_covers_prefix(prefix: str, ignore: Any, fused_mapping: Any = None) -> bool:
+    if not ignore:
+        return False
+    from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
+        should_ignore_layer,
+    )
+
+    return should_ignore_layer(
+        prefix,
+        ignore=ignore,
+        fused_mapping=fused_mapping or {},
+    )
+
+
 def is_glm_channel_int4_w4a8(hf_quant_cfg: dict[str, Any] | None) -> bool:
-    """Return whether the quant config mixes channel INT4 experts and channel INT8 linears."""
+    """Return whether the quant config mixes channel INT4 experts and channel INT8 linears.
+
+    The INT4 group must target routed experts, and those experts must not be
+    listed in ``ignore``. An INT4 group that only covers non-expert layers does
+    not select this method.
+    """
     if not isinstance(hf_quant_cfg, dict):
         return False
     if hf_quant_cfg.get("quant_method") != "compressed-tensors":
@@ -104,7 +205,7 @@ def is_glm_channel_int4_w4a8(hf_quant_cfg: dict[str, Any] | None) -> bool:
     groups = hf_quant_cfg.get("config_groups")
     if not isinstance(groups, dict):
         return False
-    has_int4 = False
+    has_int4_experts = False
     has_int8 = False
     for group in groups.values():
         if not isinstance(group, dict):
@@ -112,28 +213,190 @@ def is_glm_channel_int4_w4a8(hf_quant_cfg: dict[str, Any] | None) -> bool:
         weights = group.get("weights") or {}
         activations = group.get("input_activations") or {}
         group_format = group.get("format") or hf_quant_cfg.get("format")
-        if (
-            weights.get("num_bits") == 4
-            and weights.get("strategy") == "channel"
-            and weights.get("type") == "int"
-            and weights.get("symmetric") is True
-            and activations.get("num_bits") == 8
-            and activations.get("strategy") == "token"
-            and activations.get("dynamic") is True
-            and activations.get("type") == "int"
-            and group_format == "pack-quantized"
-        ):
-            has_int4 = True
-        if (
-            weights.get("num_bits") == 8
-            and weights.get("strategy") == "channel"
-            and weights.get("type") == "int"
-            and activations.get("num_bits") == 8
-            and activations.get("strategy") == "token"
-            and activations.get("dynamic") is True
-        ):
+        if _is_channel_int4_w4a8_scheme(weights, activations, group_format):
+            if _targets_cover_routed_experts(_group_targets(group)):
+                has_int4_experts = True
+        if _is_channel_int8_scheme(weights, activations):
             has_int8 = True
-    return has_int4 and has_int8
+    if not (has_int4_experts and has_int8):
+        return False
+    return not _ignore_covers_prefix(
+        _ROUTED_EXPERT_PREFIX,
+        hf_quant_cfg.get("ignore") or [],
+    )
+
+
+def _scheme_is_channel_int4(scheme: Any) -> bool:
+    if not isinstance(scheme, dict):
+        return False
+    return _is_channel_int4_w4a8_scheme(
+        scheme.get("weights"),
+        scheme.get("input_activations"),
+        scheme.get("format"),
+    )
+
+
+def _match_target_by_name(
+    name: str,
+    targets: Any,
+    fused_mapping: Any,
+) -> str | None:
+    """Match a layer name to a compressed-tensors target, without class fallback."""
+    from vllm.model_executor.layers.quantization.utils.config_utils import (
+        is_equal_or_regex_match,
+    )
+
+    target_list = [target for target in targets if isinstance(target, str)]
+    for target in target_list:
+        if is_equal_or_regex_match(name, target):
+            return target
+    mapping = fused_mapping or {}
+    fused = next((key for key in mapping if name.endswith(key)), None)
+    if fused is None:
+        return None
+    unfused_paths = [name.replace(fused, part) for part in mapping[fused]]
+    matched: list[str] = []
+    for unfused in unfused_paths:
+        found = next(
+            (
+                target
+                for target in target_list
+                if is_equal_or_regex_match(unfused, target)
+            ),
+            None,
+        )
+        if found is None:
+            return None
+        matched.append(found)
+    return matched[0] if matched else None
+
+
+def _expert_proj_names(layer: Any) -> tuple[str, str, str]:
+    return (
+        getattr(layer, "ckpt_gate_proj_name", "gate_proj"),
+        getattr(layer, "ckpt_up_proj_name", "up_proj"),
+        getattr(layer, "ckpt_down_proj_name", "down_proj"),
+    )
+
+
+def _explicit_expert_scheme(
+    config: Any, layer: Any, prefix: str
+) -> tuple[bool, Any]:
+    """Return ``(matched, scheme)`` for a routed-expert prefix.
+
+    ``matched`` is false when no target names this prefix or all three
+    projections. Projections may use different target strings; they select
+    INT4 only when every projection's scheme is channel INT4. Module-class
+    fallback is not used.
+    """
+    scheme_map = getattr(config, "target_scheme_map", None) or {}
+    fused_mapping = getattr(config, "packed_modules_mapping", None) or {}
+    matched = _match_target_by_name(prefix, scheme_map, fused_mapping)
+    if matched is not None:
+        return True, scheme_map.get(matched)
+    proj_schemes = []
+    for proj_name in _expert_proj_names(layer):
+        proj_target = _match_target_by_name(
+            f"{prefix}.0.{proj_name}",
+            scheme_map,
+            fused_mapping,
+        )
+        if proj_target is None:
+            return False, None
+        proj_schemes.append(scheme_map.get(proj_target))
+    if all(_scheme_is_channel_int4(scheme) for scheme in proj_schemes):
+        return True, proj_schemes[0]
+    return True, None
+
+
+def _infer_num_hidden_layers() -> int | None:
+    """Return the active model backbone size, when vLLM has one."""
+    try:
+        from vllm.config import get_current_vllm_config
+
+        hf_config = get_current_vllm_config().model_config.hf_config
+    except Exception:
+        return None
+    count = getattr(hf_config, "num_hidden_layers", None)
+    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+        return None
+    return count
+
+
+def _mtp_alias_prefixes(prefix: str, num_hidden_layers: int | None) -> list[str]:
+    """Prefixes to retry when a published expert regex misses MTP.
+
+    ``.mtp_block.`` is only inserted into some checkpoint names. The quant
+    prefix itself stays ``model.layers.{N}.mlp.experts``, with ``N`` at or
+    past ``num_hidden_layers``. Backbone experts keep their own index and are
+    not rewritten.
+    """
+    aliases: list[str] = []
+    if _MTP_BLOCK_MARKER in prefix:
+        aliases.append(prefix.replace(_MTP_BLOCK_MARKER, "."))
+    if not isinstance(num_hidden_layers, int) or num_hidden_layers <= 0:
+        return _dedupe_prefixes(prefix, aliases)
+    match = _LAYER_EXPERT_PREFIX.fullmatch(prefix)
+    if match is None or int(match.group("idx")) < num_hidden_layers:
+        return _dedupe_prefixes(prefix, aliases)
+    head = match.group("head")
+    tail = match.group("tail")
+    tail_without_mtp = tail.replace(_MTP_BLOCK_MARKER, ".")
+    for backbone in range(num_hidden_layers):
+        aliases.append(f"{head}{backbone}{tail}")
+        if tail_without_mtp != tail:
+            aliases.append(f"{head}{backbone}{tail_without_mtp}")
+    return _dedupe_prefixes(prefix, aliases)
+
+
+def _dedupe_prefixes(prefix: str, aliases: list[str]) -> list[str]:
+    unique: list[str] = []
+    for alias in aliases:
+        if alias != prefix and alias not in unique:
+            unique.append(alias)
+    return unique
+
+
+def routed_expert_uses_glm_channel_int4(
+    config: Any,
+    layer: Any,
+    prefix: str,
+    *,
+    num_hidden_layers: int | None = None,
+) -> bool:
+    """Return whether this routed-expert prefix should load channel INT4.
+
+    ``ignore`` wins. A prefix matches when its name, or all three projection
+    names, select the channel INT4 scheme. Different target strings with that
+    same scheme still match. MTP is retried only by removing ``.mtp_block.``
+    or by comparing a layer index at or past ``num_hidden_layers`` with the
+    backbone expert scheme.
+    """
+    ignore = getattr(config, "ignore", None) or []
+    fused_mapping = getattr(config, "packed_modules_mapping", None) or {}
+    if _ignore_covers_prefix(prefix, ignore, fused_mapping):
+        return False
+    matched, scheme = _explicit_expert_scheme(config, layer, prefix)
+    if matched:
+        return _scheme_is_channel_int4(scheme)
+    if _MTP_BLOCK_MARKER in prefix:
+        unwrapped = prefix.replace(_MTP_BLOCK_MARKER, ".")
+        if unwrapped == prefix or _ignore_covers_prefix(
+            unwrapped, ignore, fused_mapping
+        ):
+            return False
+        matched, scheme = _explicit_expert_scheme(config, layer, unwrapped)
+        if matched:
+            return _scheme_is_channel_int4(scheme)
+    if num_hidden_layers is None:
+        num_hidden_layers = _infer_num_hidden_layers()
+    for alias in _mtp_alias_prefixes(prefix, num_hidden_layers):
+        if _ignore_covers_prefix(alias, ignore, fused_mapping):
+            continue
+        matched, scheme = _explicit_expert_scheme(config, layer, alias)
+        if matched and _scheme_is_channel_int4(scheme):
+            return True
+    return False
 
 
 def normalize_routed_expert_checkpoint_name(

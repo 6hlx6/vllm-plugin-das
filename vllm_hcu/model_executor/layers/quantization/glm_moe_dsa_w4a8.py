@@ -2,11 +2,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 """Mixed quantization for GLM MoE DSA: channel INT4 experts and channel INT8 linears.
 
-Routed experts in the checkpoint, including MTP, are compressed-tensors
+Routed experts whose prefix matches the INT4 targets are compressed-tensors
 pack-quantized INT4 with BF16 per-channel scales and dynamic per-token INT8
-activations. Other linears stay on compressed-tensors channel INT8. The
-published INT4 regex can miss MTP layers, so every RoutedExperts module is
-loaded as INT4 when the config as a whole is this mixed scheme.
+activations. Other linears stay on compressed-tensors channel INT8. MTP experts
+retry only when ``.mtp_block.`` hides the published name, or when their layer
+index is past the backbone and the backbone expert scheme is channel INT4.
+Ignored prefixes and non-expert INT4 groups stay on the parent method.
 """
 
 from __future__ import annotations
@@ -24,10 +25,42 @@ from vllm_hcu.model_executor.layers.quantization.glm_channel_int4 import (
     is_glm_channel_int4_w4a8,
     is_glm_moe_dsa_model,
     repack_and_shuffle_w4a8_gemm2,
+    routed_expert_uses_glm_channel_int4,
 )
 from vllm_hcu.model_executor.layers.quantization.slimquant_w4a8 import (
     SlimQuantW4A8Int8AiterMoEMethod,
 )
+
+
+_GLM_W4A8_GEMM2_GENERATION = "_glm_w4a8_gemm2_generation"
+_GLM_EXPERT_WEIGHTS = ("w13_weight", "w2_weight")
+
+
+def _expert_weight_generation(layer: torch.nn.Module) -> tuple[object, ...]:
+    """Identity of the two expert weight tensors for one load generation."""
+    generation = []
+    for name in _GLM_EXPERT_WEIGHTS:
+        tensor = getattr(layer, name, None)
+        if not isinstance(tensor, torch.Tensor):
+            return ()
+        generation.append(
+            (
+                id(tensor),
+                tensor.data_ptr(),
+                tensor._version,
+                tuple(tensor.shape),
+                tuple(tensor.stride()),
+            )
+        )
+    return tuple(generation)
+
+
+def glm_expert_weights_use_gemm2_layout(layer: torch.nn.Module) -> bool:
+    """Return whether the current expert weights are the gemm2 conversion."""
+    recorded = getattr(layer, _GLM_W4A8_GEMM2_GENERATION, None)
+    if not recorded:
+        return False
+    return recorded == _expert_weight_generation(layer)
 
 
 def _disable_generic_w4a8_shuffle(config: object) -> None:
@@ -48,14 +81,18 @@ def _wrap_checkpoint_loader(param: torch.nn.Parameter, *, scale: bool) -> None:
     """
     original = param.weight_loader
 
-    def loader(loaded_param, loaded_weight, *args, **kwargs):
+    # The first parameter must be named ``param``. Layerwise reload binds this
+    # signature and then replaces ``arguments["param"]`` with the materialized
+    # Parameter. A different name leaves that replacement unused, so reload
+    # keeps writing the meta Parameter.
+    def loader(param, loaded_weight, *args, **kwargs):
         if scale:
-            loaded_weight = loaded_weight.to(dtype=loaded_param.dtype) / 16.0
+            loaded_weight = loaded_weight.to(dtype=param.dtype) / 16.0
         elif loaded_weight.dtype == torch.int32:
             loaded_weight = convert_compressed_tensors_int4_to_slimquant(
                 loaded_weight
             )
-        return original(loaded_param, loaded_weight, *args, **kwargs)
+        return original(param, loaded_weight, *args, **kwargs)
 
     param.weight_loader = loader
 
@@ -113,11 +150,19 @@ class GlmMoeDsaW4A8MoEMethod(SlimQuantW4A8Int8AiterMoEMethod):
             super().process_weights_after_loading(layer)
             return
 
-        if not getattr(layer, "_glm_w4a8_gemm2_shuffled", False):
-            for name in ("w13_weight", "w2_weight"):
+        if not glm_expert_weights_use_gemm2_layout(layer):
+            for name in _GLM_EXPERT_WEIGHTS:
                 parameter = getattr(layer, name)
                 parameter.data.copy_(repack_and_shuffle_w4a8_gemm2(parameter.data))
-            layer._glm_w4a8_gemm2_shuffled = True
+            # Record the generation after copy_ so the version matches the
+            # converted storage. Replacing either Parameter makes this miss
+            # and the conversion runs again.
+            setattr(
+                layer,
+                _GLM_W4A8_GEMM2_GENERATION,
+                _expert_weight_generation(layer),
+            )
+        layer._glm_w4a8_gemm2_shuffled = glm_expert_weights_use_gemm2_layout(layer)
 
         # Prewarm returns the M=1 config. Clear the generic shuffle so the
         # parent registers the gemm2 layout and does not call
@@ -159,6 +204,8 @@ class GlmMoeDsaChannelW4A8Config(CompressedTensorsConfig):
         return cls.get_name()
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
-        if isinstance(layer, RoutedExperts):
+        if isinstance(layer, RoutedExperts) and routed_expert_uses_glm_channel_int4(
+            self, layer, prefix
+        ):
             return GlmMoeDsaW4A8MoEMethod(self, layer.moe_config)
         return super().get_quant_method(layer, prefix)
