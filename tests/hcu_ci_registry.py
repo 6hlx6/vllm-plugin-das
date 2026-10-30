@@ -25,6 +25,21 @@ register_hcu_ci(
     est_time=900,
 )
 register_hcu_ci(
+    job="accuracy-gfx936",
+    target="tests/kernels/test_kimi_k3_kda_checkpoints_numeric.py",
+    est_time=180,
+)
+register_hcu_ci(
+    job="accuracy-gfx936",
+    target="tests/kernels/test_kimi_k3_kda_aiter_sglang.py",
+    est_time=300,
+    disabled=(
+        "requires an SGLang source tree on PYTHONPATH with "
+        "SGLANG_KDA_USE_HCU_OP=1; the HCU CI runner image does not include "
+        "SGLang"
+    ),
+)
+register_hcu_ci(
     job="accuracy-gfx938",
     target="tests/accuracy/test_hcu_kernel_accuracy.py",
     est_time=900,
@@ -72,6 +87,16 @@ register_hcu_ci(
 register_hcu_ci(
     job="accuracy-gfx938",
     target="tests/accuracy/test_lightop_autoawq_accuracy.py",
+    est_time=60,
+)
+register_hcu_ci(
+    job="accuracy-gfx936",
+    target="tests/accuracy/test_autoawq_triton_bf16.py",
+    est_time=60,
+)
+register_hcu_ci(
+    job="accuracy-gfx938",
+    target="tests/accuracy/test_autoawq_triton_bf16.py",
     est_time=60,
 )
 register_hcu_ci(
@@ -194,6 +219,21 @@ register_hcu_ci(
     job="contract-hcu-gfx936",
     target="tests/runtime_patch/test_kimi_k3_eplb_model.py",
     est_time=60,
+)
+register_hcu_ci(
+    job="contract-hcu-gfx936",
+    target="tests/kernels/test_kimi_k3_kda_cache_reuse.py",
+    est_time=300,
+)
+register_hcu_ci(
+    job="contract-hcu-gfx936",
+    target="tests/kernels/test_kimi_k3_kda_aiter_timing.py",
+    est_time=120,
+    disabled=(
+        "manual non-gating GPU timing check; it prints timing data instead of "
+        "asserting a contract, so keeping it out of required HCU gating avoids "
+        "noise from runner contention"
+    ),
 )
 register_hcu_ci(
     job="contract-hcu-gfx936",
