@@ -69,7 +69,9 @@ def commit_installed_glm_w4a8_gemm2_generation(layer: torch.nn.Module) -> None:
     Checkpoint reload records the marker on the temporary materialized
     Parameter, then copies those bytes back onto the original runtime
     Parameter. Kernel-format reload copies into that same Parameter and
-    bumps its version. Neither path may run gemm2 repack again.
+    bumps its version. Rebind the existing quant config to the installed
+    scale owners as well, preserving references held by the execution path.
+    Neither path may run gemm2 repack again.
     """
     if not getattr(layer, _GLM_W4A8_GEMM2_GENERATION, None):
         return
@@ -78,10 +80,20 @@ def commit_installed_glm_w4a8_gemm2_generation(layer: torch.nn.Module) -> None:
         return
     setattr(layer, _GLM_W4A8_GEMM2_GENERATION, generation)
     layer._glm_w4a8_gemm2_shuffled = True
+    method = getattr(layer, "quant_method", None)
+    if isinstance(method, GlmMoeDsaW4A8MoEMethod):
+        quant_config = getattr(method, "moe_quant_config", None)
+        if quant_config is not None:
+            from vllm_hcu.model_executor.layers.quantization.compressed_tensors_moe_runtime import (
+                _replace_tensor_reference,
+            )
+
+            _replace_tensor_reference(quant_config, "w1_scale", layer.w13_weight_scale)
+            _replace_tensor_reference(quant_config, "w2_scale", layer.w2_weight_scale)
 
 
 def commit_installed_glm_w4a8_gemm2_generations(model: torch.nn.Module) -> None:
-    """Refresh gemm2 markers after reload has restored runtime parameters."""
+    """Refresh GLM gemm2 markers and scale owners on final runtime parameters."""
     for module in model.modules():
         commit_installed_glm_w4a8_gemm2_generation(module)
 

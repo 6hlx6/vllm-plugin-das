@@ -136,6 +136,7 @@ def _is_channel_int4_w4a8_scheme(
         and _quant_field(activations, "strategy") == "token"
         and _quant_field(activations, "dynamic") is True
         and _quant_field(activations, "type") == "int"
+        and _quant_field(activations, "symmetric") is not False
         and getattr(group_format, "value", group_format) == "pack-quantized"
     )
 
@@ -216,7 +217,7 @@ def _targets_cover_routed_experts(
     )
 
     for module_prefix, probe in _routed_expert_probes(targets, hf_config):
-        if _ignore_covers_prefix(module_prefix, ignore):
+        if _ignore_covers_expert(None, module_prefix, ignore, {}):
             continue
         for target in targets:
             if target == "RoutedExperts" or is_equal_or_regex_match(probe, target):
@@ -360,6 +361,23 @@ def _expert_proj_names(layer: Any) -> tuple[str, str, str]:
     )
 
 
+def _ignore_covers_expert(
+    layer: Any, prefix: str, ignore: Any, fused_mapping: Any
+) -> bool:
+    """Apply owner/projection exclusions to runtime and checkpoint paths."""
+    prefixes = [prefix]
+    if _MTP_BLOCK_MARKER in prefix:
+        prefixes.append(prefix.replace(_MTP_BLOCK_MARKER, "."))
+    return any(
+        _ignore_covers_prefix(candidate, ignore, fused_mapping)
+        or any(
+            _ignore_covers_prefix(proj_name, ignore, fused_mapping)
+            for proj_name in _projection_names(layer, candidate)
+        )
+        for candidate in prefixes
+    )
+
+
 def _explicit_expert_scheme(
     config: Any, layer: Any, prefix: str
 ) -> tuple[bool, Any]:
@@ -453,29 +471,20 @@ def routed_expert_uses_glm_channel_int4(
     """
     ignore = getattr(config, "ignore", None) or []
     fused_mapping = getattr(config, "packed_modules_mapping", None) or {}
-    if _ignore_covers_prefix(prefix, ignore, fused_mapping):
-        return False
-    if any(
-        _ignore_covers_prefix(proj_name, ignore, fused_mapping)
-        for proj_name in _projection_names(layer, prefix)
-    ):
+    if _ignore_covers_expert(layer, prefix, ignore, fused_mapping):
         return False
     matched, scheme = _explicit_expert_scheme(config, layer, prefix)
     if matched:
         return _scheme_is_channel_int4(scheme, config)
-    if _MTP_BLOCK_MARKER in prefix:
-        unwrapped = prefix.replace(_MTP_BLOCK_MARKER, ".")
-        if unwrapped == prefix or _ignore_covers_prefix(
-            unwrapped, ignore, fused_mapping
-        ):
-            return False
+    unwrapped = prefix.replace(_MTP_BLOCK_MARKER, ".")
+    if unwrapped != prefix:
         matched, scheme = _explicit_expert_scheme(config, layer, unwrapped)
         if matched:
             return _scheme_is_channel_int4(scheme, config)
     if num_hidden_layers is None:
         num_hidden_layers = _infer_num_hidden_layers()
     for alias in _mtp_alias_prefixes(prefix, num_hidden_layers):
-        if _ignore_covers_prefix(alias, ignore, fused_mapping):
+        if _ignore_covers_expert(layer, alias, ignore, fused_mapping):
             continue
         matched, scheme = _explicit_expert_scheme(config, layer, alias)
         if matched and _scheme_is_channel_int4(scheme, config):

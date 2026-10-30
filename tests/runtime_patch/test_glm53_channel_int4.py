@@ -3,6 +3,7 @@
 """Packing conversion, AITER gemm2 layout, and quant detection for GLM-5.3 channel INT4."""
 
 import sys
+from functools import partial
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -235,6 +236,129 @@ def _selection_config(**overrides: object) -> SimpleNamespace:
     for key, value in overrides.items():
         setattr(config, key, value)
     return config
+
+
+@pytest.mark.parametrize("symmetric", [None, True, False])
+@pytest.mark.parametrize("args_as_objects", [False, True])
+def test_int4_activation_symmetry_is_respected(symmetric, args_as_objects) -> None:
+    from vllm_hcu.model_executor.layers.quantization.glm_channel_int4 import (
+        routed_expert_uses_glm_channel_int4,
+    )
+
+    quant = _quant_config()
+    group = quant["config_groups"]["group_int4"]
+    if symmetric is not None:
+        group["input_activations"]["symmetric"] = symmetric
+    if args_as_objects:
+        group["weights"] = SimpleNamespace(**group["weights"])
+        group["input_activations"] = SimpleNamespace(**group["input_activations"])
+    expected = symmetric is not False
+    assert is_glm_channel_int4_w4a8(quant, _glm_hf_config()) is expected
+    assert GlmMoeDsaW4A8Facade.override_quantization_method(
+        quant, None, _glm_hf_config()
+    ) == ("glm_moe_dsa_w4a8" if expected else None)
+    config = _selection_config(target_scheme_map={group["targets"][0]: group})
+    assert routed_expert_uses_glm_channel_int4(
+        config, SimpleNamespace(), "model.layers.0.mlp.experts"
+    ) is expected
+
+
+def test_int8_linear_symmetry_stays_on_compressed_tensors() -> None:
+    quant = _quant_config()
+    quant["config_groups"]["group_int8"]["input_activations"]["symmetric"] = False
+    assert is_glm_channel_int4_w4a8(quant, _glm_hf_config())
+
+
+@pytest.mark.parametrize("target", ["re:.*\\.mlp\\.experts.*", "RoutedExperts"])
+def test_auto_detection_honors_projection_ignores(target) -> None:
+    quant = _quant_config()
+    quant["config_groups"]["group_int4"]["targets"] = [target]
+    quant["ignore"] = ["re:.*experts\\.\\d+\\.(gate_proj|up_proj|down_proj)$"]
+    assert is_glm_channel_int4_w4a8(quant, _glm_hf_config()) is False
+    # One excluded layer must not hide other valid routed experts.
+    quant["ignore"] = ["re:^model\\.layers\\.0\\.mlp\\.experts\\.0\\.gate_proj$"]
+    assert is_glm_channel_int4_w4a8(quant, _glm_hf_config()) is True
+
+
+@pytest.mark.parametrize("target_kind", ["projection", "owner", "class"])
+@pytest.mark.parametrize("projection", ["gate_proj", "up_proj", "down_proj"])
+def test_mtp_checkpoint_projection_ignores_apply_before_dispatch(
+    target_kind, projection
+) -> None:
+    from vllm_hcu.model_executor.layers.quantization.glm_channel_int4 import (
+        routed_expert_uses_glm_channel_int4,
+    )
+
+    class RoutedExperts:
+        pass
+
+    layer = RoutedExperts()
+    prefix = "model.layers.61.mtp_block.mlp.experts"
+    checkpoint_prefix = "model.layers.61.mlp.experts"
+    targets = {
+        "projection": "re:^model\\.layers\\.61\\.mlp\\.experts\\.0\\.(gate_proj|up_proj|down_proj)$",
+        "owner": "re:.*\\.mlp\\.experts.*",
+        "class": "RoutedExperts",
+    }
+    config = _selection_config(
+        ignore=[f"{checkpoint_prefix}.0.{projection}"],
+        target_scheme_map={targets[target_kind]: _int4_scheme()},
+    )
+    for candidate in (prefix, checkpoint_prefix):
+        assert routed_expert_uses_glm_channel_int4(
+            config, layer, candidate, num_hidden_layers=61
+        ) is False
+    config.ignore = []
+    assert routed_expert_uses_glm_channel_int4(
+        config, layer, prefix, num_hidden_layers=61
+    ) is True
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+@pytest.mark.parametrize("projection", ["gate_proj", "up_proj", "down_proj"])
+def test_mtp_backbone_alias_honors_projection_ignores(wrapped, projection) -> None:
+    from vllm_hcu.model_executor.layers.quantization.glm_channel_int4 import (
+        routed_expert_uses_glm_channel_int4,
+    )
+
+    target = "re:^model\\.layers\\.0\\.mlp\\.experts\\.0\\.(gate_proj|up_proj|down_proj)$"
+    config = _selection_config(
+        ignore=[f"model.layers.0.mlp.experts.0.{projection}"],
+        target_scheme_map={target: _int4_scheme()},
+    )
+    prefix = "model.layers.61.mlp.experts"
+    if wrapped:
+        prefix = "model.layers.61.mtp_block.mlp.experts"
+    assert routed_expert_uses_glm_channel_int4(
+        config, SimpleNamespace(), prefix, num_hidden_layers=61
+    ) is False
+    # Continue to a valid backbone scheme instead of rejecting all aliases.
+    config.target_scheme_map[target.replace("layers\\.0", "layers\\.1")] = _int4_scheme()
+    assert routed_expert_uses_glm_channel_int4(
+        config, SimpleNamespace(), prefix, num_hidden_layers=61
+    ) is True
+
+
+@pytest.mark.parametrize("projection", ["gate_proj", "up_proj", "down_proj"])
+def test_wrapped_backbone_alias_honors_checkpoint_projection_ignores(projection):
+    from vllm_hcu.model_executor.layers.quantization.glm_channel_int4 import (
+        routed_expert_uses_glm_channel_int4,
+    )
+
+    config = _selection_config(
+        ignore=[f"model.layers.0.mlp.experts.0.{projection}"],
+        target_scheme_map={
+            "re:^model\\.layers\\.0\\.mtp_block\\.mlp\\.experts.*": _int4_scheme(),
+        },
+    )
+    prefix = "model.layers.61.mtp_block.mlp.experts"
+    assert routed_expert_uses_glm_channel_int4(
+        config, SimpleNamespace(), prefix, num_hidden_layers=61
+    ) is False
+    config.ignore = []
+    assert routed_expert_uses_glm_channel_int4(
+        config, SimpleNamespace(), prefix, num_hidden_layers=61
+    ) is True
 
 
 def test_routed_expert_selection_respects_targets_ignore_and_mtp() -> None:
@@ -730,7 +854,65 @@ def test_glm_aiter_post_load_repacks_replaced_weights(monkeypatch) -> None:
     assert layer._glm_w4a8_gemm2_shuffled is True
 
 
-def test_reload_weights_keeps_gemm2_generation_for_later_forward(monkeypatch) -> None:
+@pytest.mark.parametrize("glm_method", [False, True])
+@pytest.mark.parametrize("gemm2_marked", [False, True])
+def test_reload_scale_refresh_is_scoped_to_glm_gemm2(glm_method, gemm2_marked):
+    from vllm_hcu.model_executor.layers.quantization.glm_moe_dsa_w4a8 import (
+        commit_installed_glm_w4a8_gemm2_generations,
+    )
+    from vllm_hcu.model_executor.layers.quantization.slimquant_w4a8 import (
+        SlimQuantW4A8Int8AiterMoEMethod,
+    )
+
+    method, layer = _glm_aiter_method("auto")
+    if not glm_method:
+        method = SlimQuantW4A8Int8AiterMoEMethod.__new__(
+            SlimQuantW4A8Int8AiterMoEMethod
+        )
+    layer.quant_method = method
+    layer.w13_weight_scale = torch.nn.Parameter(torch.ones(1), requires_grad=False)
+    layer.w2_weight_scale = torch.nn.Parameter(torch.ones(1), requires_grad=False)
+    layer.w13_input_scale = None
+    layer.w2_input_scale = None
+    quant_config = method.get_fused_moe_quant_config(layer)
+    old_w1_scale = quant_config.w1_scale
+    old_w2_scale = quant_config.w2_scale
+    layer.w13_weight_scale = torch.nn.Parameter(torch.full((1,), 7.0), requires_grad=False)
+    layer.w2_weight_scale = torch.nn.Parameter(torch.full((1,), 11.0), requires_grad=False)
+    if gemm2_marked:
+        layer._glm_w4a8_gemm2_generation = ("previous owners",)
+
+    commit_installed_glm_w4a8_gemm2_generations(layer)
+
+    assert method.moe_quant_config is quant_config
+    if glm_method and gemm2_marked:
+        assert quant_config.w1_scale is layer.w13_weight_scale
+        assert quant_config.w2_scale is layer.w2_weight_scale
+    else:
+        assert quant_config.w1_scale is old_w1_scale
+        assert quant_config.w2_scale is old_w2_scale
+
+
+def _v2_reload_runner(model):
+    from vllm_hcu.v1.hcu_model_runner_v2 import HcuGPUModelRunnerV2
+
+    # Exercise the inherited reload implementation without allocating a model
+    # runner's device buffers or initializing unrelated LoRA/MM caches.
+    runner = object.__new__(HcuGPUModelRunnerV2)
+    runner.model = model
+    runner.model_config = SimpleNamespace(quantization="glm_moe_dsa_w4a8")
+    runner.load_config = SimpleNamespace()
+    runner.lora_config = None
+    runner.reset_lora_state = lambda: None
+    runner.reset_encoder_cache = lambda: None
+    runner.reset_mm_cache = lambda: None
+    return runner
+
+
+@pytest.mark.parametrize("runner_kind", ["legacy", "v2"])
+def test_reload_weights_keeps_gemm2_generation_for_later_forward(
+    monkeypatch, runner_kind
+) -> None:
     from vllm.model_executor.model_loader.reload.layerwise import (
         record_metadata_for_reloading,
     )
@@ -738,12 +920,23 @@ def test_reload_weights_keeps_gemm2_generation_for_later_forward(monkeypatch) ->
         compressed_tensors_moe_runtime,
     )
     from vllm_hcu.model_executor.layers.quantization.glm_moe_dsa_w4a8 import (
+        _wrap_checkpoint_loader,
         glm_expert_weights_use_gemm2_layout,
     )
-    from vllm_hcu.v1.hcu_model_runner import GPUModelRunner
-
+    from vllm_hcu.model_executor.layers.quantization.slimquant_w4a8 import (
+        SlimQuantW4A8Int8AiterMoEMethod,
+    )
     config = SimpleNamespace(need_shuffle=True, need_shuffle_scale=True)
+    parent_post_load = SlimQuantW4A8Int8AiterMoEMethod.process_weights_after_loading
     calls = _patch_glm_post_load(monkeypatch, config)
+    # Keep the real quant-config construction and scale binding during reload.
+    monkeypatch.setattr(
+        SlimQuantW4A8Int8AiterMoEMethod,
+        "process_weights_after_loading",
+        parent_post_load,
+    )
+    config.quant_type = "w4a8"
+    config.solution_type = "moe_c"
     method, _layer = _glm_aiter_method("auto")
 
     class ExpertModel(torch.nn.Module):
@@ -758,6 +951,14 @@ def test_reload_weights_keeps_gemm2_generation_for_later_forward(monkeypatch) ->
                 torch.arange(16, dtype=torch.int8).reshape(2, 4, 2),
                 requires_grad=False,
             )
+            self.w13_weight_scale = torch.nn.Parameter(
+                torch.ones((2, 8, 1)), requires_grad=False
+            )
+            self.w2_weight_scale = torch.nn.Parameter(
+                torch.ones((2, 4, 1)), requires_grad=False
+            )
+            self.register_parameter("w13_input_scale", None)
+            self.register_parameter("w2_input_scale", None)
 
         def load_weights(self, weights):
             params = dict(self.named_parameters())
@@ -776,12 +977,16 @@ def test_reload_weights_keeps_gemm2_generation_for_later_forward(monkeypatch) ->
         param.data.copy_(loaded_weight)
 
     model = ExpertModel()
-    model.w13_weight.weight_loader = base_loader
-    model.w2_weight.weight_loader = base_loader
+    for name, param in model.named_parameters():
+        param.weight_loader = base_loader
+        _wrap_checkpoint_loader(param, scale=name.endswith("_scale"))
     model.global_num_experts = 2
     model.swiglu_limit = None
     model._expert_map = None
     model.expert_mask = None
+    # Native reload metadata describes checkpoint storage before post-load
+    # installs kernel layout attributes on the runtime Parameters.
+    record_metadata_for_reloading(model)
     compressed_tensors_moe_runtime.install_aiter_moe_weight_layout(
         model,
         SimpleNamespace(
@@ -792,42 +997,119 @@ def test_reload_weights_keeps_gemm2_generation_for_later_forward(monkeypatch) ->
         ),
         logical_shape=(2, 8, 4, 4),
     )
-    record_metadata_for_reloading(model)
     original_w13 = model.w13_weight
     original_w2 = model.w2_weight
-    runner = SimpleNamespace(
-        get_model=lambda: model,
-        model_config=SimpleNamespace(quantization="glm_moe_dsa_w4a8"),
-        load_config=SimpleNamespace(),
-    )
+    original_w13_scale = model.w13_weight_scale
+    original_w2_scale = model.w2_weight_scale
+    if runner_kind == "v2":
+        runner = _v2_reload_runner(model)
+        reload_weights = runner.reload_weights
+    else:
+        from vllm_hcu.v1.hcu_model_runner import GPUModelRunner
+
+        runner = SimpleNamespace(
+            get_model=lambda: model,
+            model_config=SimpleNamespace(quantization="glm_moe_dsa_w4a8"),
+            load_config=SimpleNamespace(),
+        )
+        reload_weights = partial(GPUModelRunner.reload_weights, runner)
     checkpoint = [
         ("w13_weight", torch.ones_like(original_w13)),
         ("w2_weight", torch.ones_like(original_w2)),
+        ("w13_weight_scale", torch.full_like(original_w13_scale, 32.0)),
+        ("w2_weight_scale", torch.full_like(original_w2_scale, 48.0)),
     ]
-    GPUModelRunner.reload_weights(
-        runner, iter(checkpoint), is_checkpoint_format=True
-    )
+    reload_weights(iter(checkpoint), is_checkpoint_format=True)
 
     assert model.w13_weight is original_w13
     assert model.w2_weight is original_w2
     assert calls["repack"] == 2
     assert glm_expert_weights_use_gemm2_layout(model)
     assert torch.equal(model.w13_weight, torch.ones_like(original_w13) + 1)
+    assert model.w13_weight_scale is original_w13_scale
+    assert model.w2_weight_scale is original_w2_scale
+    assert method.moe_quant_config.w1_scale is original_w13_scale
+    assert method.moe_quant_config.w2_scale is original_w2_scale
     calls_forward = _forward_reloaded_gemm2(monkeypatch, model)
     assert calls_forward["execute"]["use_weight_shuffle"] is False
+    assert torch.all(calls_forward["execute"]["w1_scale"] == 2.0)
+    assert torch.all(calls_forward["execute"]["w2_scale"] == 3.0)
+    installed_quant_config = method.moe_quant_config
 
     kernel = [
         ("w13_weight", model.w13_weight.detach().clone()),
         ("w2_weight", model.w2_weight.detach().clone()),
+        ("w13_weight_scale", torch.full_like(original_w13_scale, 7.0)),
+        ("w2_weight_scale", torch.full_like(original_w2_scale, 11.0)),
     ]
-    GPUModelRunner.reload_weights(runner, iter(kernel), is_checkpoint_format=False)
+    reload_weights(iter(kernel), is_checkpoint_format=False)
     assert calls["repack"] == 2
     assert glm_expert_weights_use_gemm2_layout(model)
+    assert method.moe_quant_config is installed_quant_config
+    for num_tokens in (1, 3):
+        calls_forward = _forward_reloaded_gemm2(monkeypatch, model, num_tokens)
+        assert calls_forward["execute"]["use_weight_shuffle"] is False
+        assert calls_forward["execute"]["w1_scale"] is original_w13_scale
+        assert calls_forward["execute"]["w2_scale"] is original_w2_scale
+        assert torch.all(calls_forward["execute"]["w1_scale"] == 7.0)
+        assert torch.all(calls_forward["execute"]["w2_scale"] == 11.0)
+
+    # A later checkpoint reload must convert its fresh bytes exactly once and
+    # restore the same runtime owners after a kernel-format update.
+    reload_weights(iter(checkpoint), is_checkpoint_format=True)
+    assert calls["repack"] == 4
+    assert glm_expert_weights_use_gemm2_layout(model)
+    assert model.w13_weight is original_w13
+    assert model.w2_weight is original_w2
+    assert method.moe_quant_config.w1_scale is original_w13_scale
+    assert method.moe_quant_config.w2_scale is original_w2_scale
     calls_forward = _forward_reloaded_gemm2(monkeypatch, model)
     assert calls_forward["execute"]["use_weight_shuffle"] is False
+    assert torch.all(calls_forward["execute"]["w1_scale"] == 2.0)
+    assert torch.all(calls_forward["execute"]["w2_scale"] == 3.0)
 
 
-def _forward_reloaded_gemm2(monkeypatch, layer):
+def test_v2_reload_failure_does_not_commit_gemm2_generation(monkeypatch) -> None:
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+    method, model = _glm_aiter_method("auto")
+    model.quant_method = method
+    generation = ("unprocessed weights",)
+    model._glm_w4a8_gemm2_generation = generation
+    runner = _v2_reload_runner(model)
+    weights = iter(())
+    failure = RuntimeError("upstream reload failed")
+
+    def failed_reload(self, *args, **kwargs):
+        assert self is runner
+        assert args == (weights,)
+        assert kwargs == {"is_checkpoint_format": False}
+        raise failure
+
+    monkeypatch.setattr(GPUModelRunner, "reload_weights", failed_reload)
+    with pytest.raises(RuntimeError, match="upstream reload failed") as exc_info:
+        runner.reload_weights(weights, is_checkpoint_format=False)
+    assert exc_info.value is failure
+    assert model._glm_w4a8_gemm2_generation is generation
+    assert not getattr(model, "_glm_w4a8_gemm2_shuffled", False)
+
+
+def test_v2_reload_preserves_non_glm_parameter_owners() -> None:
+    model = torch.nn.Linear(4, 3, bias=False)
+    model.requires_grad_(False)
+    original_weight = model.weight
+    runner = _v2_reload_runner(model)
+    runner.model_config.quantization = None
+    runner.reload_weights(
+        iter([("weight", torch.full_like(original_weight, 5.0))]),
+        is_checkpoint_format=False,
+    )
+    assert model.weight is original_weight
+    assert torch.all(model.weight == 5.0)
+    assert not hasattr(model, "_glm_w4a8_gemm2_generation")
+
+
+def _forward_reloaded_gemm2(monkeypatch, layer, num_tokens=3):
     from vllm_hcu.model_executor.layers.quantization import (
         compressed_tensors_moe_runtime,
     )
@@ -847,7 +1129,7 @@ def _forward_reloaded_gemm2(monkeypatch, layer):
 
     def aiter_moe(**kwargs: object):
         calls["execute"] = kwargs
-        return torch.zeros((3, 4), dtype=kwargs["output_dtype"])
+        return torch.zeros((num_tokens, 4), dtype=kwargs["output_dtype"])
 
     monkeypatch.setitem(
         sys.modules,
@@ -859,21 +1141,12 @@ def _forward_reloaded_gemm2(monkeypatch, layer):
             aiter_moe=aiter_moe,
         ),
     )
-    apply_method = SimpleNamespace(
-        moe=SimpleNamespace(num_experts=2),
-        moe_quant_config=SimpleNamespace(
-            w1_scale=torch.ones((2, 8, 1)),
-            w2_scale=torch.ones((2, 4, 1)),
-            a1_scale=None,
-            a2_scale=None,
-        ),
-    )
     compressed_tensors_moe_runtime.apply_aiter_w4a8_moe(
-        apply_method,
+        layer.quant_method,
         layer,
-        torch.ones((3, 4), dtype=torch.bfloat16),
-        torch.ones((3, 2), dtype=torch.float32),
-        torch.zeros((3, 2), dtype=torch.int32),
+        torch.ones((num_tokens, 4), dtype=torch.bfloat16),
+        torch.ones((num_tokens, 2), dtype=torch.float32),
+        torch.zeros((num_tokens, 2), dtype=torch.int32),
     )
     return calls
 
