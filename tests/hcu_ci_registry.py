@@ -31,6 +31,16 @@ register_hcu_ci(
 )
 register_hcu_ci(
     job="accuracy-gfx938",
+    target="tests/model_executor/test_step5_upstream_delta.py::test_causal_fp8_prefill_scores_preserve_group_major_strided_output",
+    est_time=60,
+)
+register_hcu_ci(
+    job="accuracy-gfx938",
+    target="tests/model_executor/test_step5_upstream_delta.py::test_resident_prefill_selection_matches_radix_with_ties_and_padding",
+    est_time=60,
+)
+register_hcu_ci(
+    job="accuracy-gfx938",
     target="tests/accuracy/test_aiter_silu_and_mul.py",
     est_time=300,
 )
@@ -82,6 +92,16 @@ register_hcu_ci(
 register_hcu_ci(
     job="accuracy-gfx938",
     target="tests/runtime_patch/test_gate_linear_context.py",
+    est_time=180,
+)
+register_hcu_ci(
+    job="accuracy-gfx938",
+    target="tests/runtime_patch/test_bf16_fp32_mmac.py",
+    est_time=300,
+)
+register_hcu_ci(
+    job="accuracy-gfx938",
+    target="tests/runtime_patch/test_dsv4_skinny_lm_head.py",
     est_time=180,
 )
 
