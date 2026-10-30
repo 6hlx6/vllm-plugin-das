@@ -1723,7 +1723,9 @@ class MooncakeConnectorWorker:
         self._kv_load_error: str | None = None
         self._layerwise_lock = threading.Lock()
         self._layerwise_epoch = 0
-        self._layerwise_computed: list[tuple[int, str, Any]] = []
+        self._layerwise_computed: dict[int, list[tuple[str, Any]]] = {}
+        self._layerwise_flush_scheduled = False
+        self._layerwise_flush_lock = asyncio.Lock()
         self._layerwise_alloc_blocks: dict[str, tuple[int, list[list[int]], str]] = {}
         self._layerwise_final_blocks: dict[str, list[list[int]]] = {}
         self._layerwise_sessions: dict[tuple, Any] = {}
@@ -2452,11 +2454,29 @@ class MooncakeConnectorWorker:
             return
         event = _record_kv_ready_event()
         with self._layerwise_lock:
-            self._layerwise_computed.append((self._layerwise_epoch, layer_name, event))
+            self._layerwise_computed.setdefault(self._layerwise_epoch, []).append(
+                (layer_name, event)
+            )
+        self._schedule_layerwise_flush()
+
+    def _schedule_layerwise_flush(self) -> None:
+        """Coalesce callbacks until the sender loop starts a flush."""
         sender_loop = getattr(self, "sender_loop", None)
         if sender_loop is None:
             return
-        asyncio.run_coroutine_threadsafe(self._layerwise_flush(), sender_loop)
+        with self._layerwise_lock:
+            if self._layerwise_flush_scheduled:
+                return
+            self._layerwise_flush_scheduled = True
+        asyncio.run_coroutine_threadsafe(self._flush_scheduled_layers(), sender_loop)
+
+    async def _flush_scheduled_layers(self) -> None:
+        with self._layerwise_lock:
+            self._layerwise_flush_scheduled = False
+        try:
+            await self._layerwise_flush()
+        except Exception:
+            logger.exception("Mooncake scheduled layerwise flush failed")
 
     def _begin_layerwise_forward(self, metadata: MooncakeConnectorMetadata) -> None:
         """One epoch per forward. Alloc block ids stay separate from the p_ready placeholder."""
@@ -2472,16 +2492,18 @@ class MooncakeConnectorWorker:
                         req_id,
                     )
             current = self._layerwise_epoch
-            self._layerwise_computed = [
-                item for item in self._layerwise_computed if item[0] >= current - 2
-            ]
-            # 握手可能先到。此时 session 还没有 block，补上后才能在本轮 forward 里按层发。
+            self._layerwise_computed = {
+                epoch: items
+                for epoch, items in self._layerwise_computed.items()
+                if epoch >= current - 2
+            }
+            # A handshake may arrive before block allocation.
             _apply_alloc_to_layerwise_sessions(
                 self._layerwise_sessions, self._layerwise_alloc_blocks
             )
         sender_loop = getattr(self, "sender_loop", None)
         if sender_loop is not None and alloc:
-            asyncio.run_coroutine_threadsafe(self._layerwise_flush(), sender_loop)
+            self._schedule_layerwise_flush()
         self._notify_layerwise_proxy(getattr(metadata, "layerwise_notify", None) or {})
 
     def _notify_layerwise_proxy(self, notifies: dict[str, str]) -> None:
@@ -2538,12 +2560,33 @@ class MooncakeConnectorWorker:
         if block_ids and not send_meta.local_block_ids:
             # Fill block ids only. Do not set ready; bulk send still waits for prefill.
             send_meta.local_block_ids = block_ids
+        regions_by_layer: dict[
+            int, tuple[list[TransferRegion], list[TransferRegion]]
+        ] = {}
+        region_indices_by_name: dict[str, set[int]] = defaultdict(set)
+        indexer_layers: set[int] = set()
+        for local_region, remote_region in zip(local_regions, remote_regions):
+            layer_index = local_region.layer_index
+            paired_local, paired_remote = regions_by_layer.setdefault(
+                layer_index, ([], [])
+            )
+            paired_local.append(local_region)
+            paired_remote.append(remote_region)
+            region_indices_by_name[local_region.layer_name].add(layer_index)
+            if "indexer" in local_region.layer_name:
+                indexer_layers.add(layer_index)
         self._layerwise_sessions[key] = {
             "d_req_id": d_req_id,
             "send_meta": send_meta,
             "meta": meta,
             "local_regions": local_regions,
             "remote_regions": remote_regions,
+            "regions_by_layer": regions_by_layer,
+            "region_indices_by_name": region_indices_by_name,
+            "indexer_layers": indexer_layers,
+            "hook_indices": {},
+            "computed_cursor": 0,
+            "pending_events": {},
             "remote_session": f"{meta.remote_hostname}:{meta.remote_port}",
             "epoch": epoch,
             "block_ids": block_ids,
@@ -2556,17 +2599,21 @@ class MooncakeConnectorWorker:
         }
 
     async def _layerwise_flush(self) -> None:
-        """Submit computed layers that already have a handshake. Skip layers already sent."""
-        with self._layerwise_lock:
-            computed = list(self._layerwise_computed)
-            finals = dict(self._layerwise_final_blocks)
-        for session in list(self._layerwise_sessions.values()):
-            await self._flush_one_layerwise_session(session, computed, finals)
+        """Flush new callbacks for sessions with an active handshake."""
+        async with self._layerwise_flush_lock:
+            with self._layerwise_lock:
+                computed = {
+                    epoch: list(items)
+                    for epoch, items in self._layerwise_computed.items()
+                }
+                finals = dict(self._layerwise_final_blocks)
+            for session in list(self._layerwise_sessions.values()):
+                await self._flush_one_layerwise_session(session, computed, finals)
 
     async def _flush_one_layerwise_session(
         self,
         session: dict,
-        computed: list[tuple[int, str, Any]],
+        computed: dict[int, list[tuple[str, Any]]],
         finals: dict[str, list[list[int]]],
     ) -> None:
         transfer_id = session["send_meta"].transfer_id
@@ -2584,20 +2631,31 @@ class MooncakeConnectorWorker:
         send_meta = session["send_meta"]
         previous_blocks = send_meta.local_block_ids
         send_meta.local_block_ids = session["block_ids"]
-        wanted: set[int] = set()
-        events_by_index: dict[int, Any] = {}
-        for epoch, layer_name, event in computed:
-            if epoch != session["epoch"]:
-                continue
-            for region in session["local_regions"]:
-                if _region_belongs_to_layer(region, layer_name):
-                    wanted.add(region.layer_index)
-                    events_by_index.setdefault(region.layer_index, event)
+        regions_by_layer = session["regions_by_layer"]
+        events_by_index = session["pending_events"]
+        epoch_computed = computed.get(session["epoch"], [])
+        for cursor in range(session["computed_cursor"], len(epoch_computed)):
+            layer_name, event = epoch_computed[cursor]
+            indices = session["hook_indices"].get(layer_name)
+            if indices is None:
+                indices = set(session["region_indices_by_name"].get(layer_name, ()))
+                try:
+                    hook_index = extract_layer_index(layer_name)
+                except Exception:
+                    hook_index = None
+                if hook_index in regions_by_layer and (
+                    "indexer" in layer_name or hook_index in session["indexer_layers"]
+                ):
+                    indices.add(hook_index)
+                session["hook_indices"][layer_name] = indices
+            for layer_index in indices - session["sent_layers"]:
+                events_by_index[layer_index] = (cursor, event)
+        session["computed_cursor"] = len(epoch_computed)
         if session.get("prefill_done"):
-            for region in session["local_regions"]:
-                wanted.add(region.layer_index)
-        pending_indices = sorted(wanted - session["sent_layers"])
-        # 未结束时不满一组就留下，避免每一层都做一次同步写。
+            for layer_index in regions_by_layer.keys() - session["sent_layers"]:
+                events_by_index.setdefault(layer_index, (-1, None))
+        pending_indices = sorted(events_by_index)
+        # Keep partial groups pending until prefill finishes.
         if (
             pending_indices
             and not session.get("prefill_done")
@@ -2606,23 +2664,25 @@ class MooncakeConnectorWorker:
             if previous_blocks:
                 send_meta.local_block_ids = previous_blocks
             return
+        paired_local = []
+        paired_remote = []
+        for layer_index in pending_indices:
+            local, remote = regions_by_layer[layer_index]
+            paired_local.extend(local)
+            paired_remote.extend(remote)
         grouped_src: list[int] = []
         grouped_dst: list[int] = []
         grouped_len: list[int] = []
-        grouped_layers: list[int] = []
         latest_event = None
-        for layer_index in pending_indices:
-            paired_local = []
-            paired_remote = []
-            for local_region, remote_region in zip(
-                session["local_regions"], session["remote_regions"]
-            ):
-                if local_region.layer_index == layer_index:
-                    paired_local.append(local_region)
-                    paired_remote.append(remote_region)
-            if not paired_local:
-                session["sent_layers"].add(layer_index)
-                continue
+        if pending_indices:
+            # Wait for the last callback, even if hooks arrive out of layer order.
+            ready_events = [
+                events_by_index[index]
+                for index in pending_indices
+                if events_by_index[index][1] is not None
+            ]
+            if ready_events:
+                latest_event = max(ready_events, key=lambda item: item[0])[1]
             src_ptrs, dst_ptrs, lengths, err_reqs, err_msg = (
                 await self._build_transfer_params(
                     [(session["d_req_id"], send_meta)],
@@ -2631,21 +2691,15 @@ class MooncakeConnectorWorker:
                     paired_remote,
                 )
             )
-            session["sent_layers"].add(layer_index)
+            session["sent_layers"].update(pending_indices)
+            for layer_index in pending_indices:
+                events_by_index.pop(layer_index, None)
             if session["sent_with_blocks"] is None:
                 session["sent_with_blocks"] = session["block_ids"]
             if err_reqs:
                 session["errors"].append(err_msg or "layerwise transfer build failed")
-                continue
-            if not src_ptrs:
-                continue
-            grouped_layers.append(layer_index)
-            grouped_src.extend(src_ptrs)
-            grouped_dst.extend(dst_ptrs)
-            grouped_len.extend(lengths)
-            layer_event = events_by_index.get(layer_index)
-            if layer_event is not None:
-                latest_event = layer_event
+            else:
+                grouped_src, grouped_dst, grouped_len = src_ptrs, dst_ptrs, lengths
         if grouped_src:
             if not session["send_meta"].ttft_send_start_logged:
                 log_ttft_event(
@@ -2655,12 +2709,15 @@ class MooncakeConnectorWorker:
                 )
                 session["send_meta"].ttft_send_start_logged = True
             logger.info(
-                "Mooncake layerwise send layers=%s-%s count=%s descs=%s prefill_done=%s",
-                grouped_layers[0],
-                grouped_layers[-1],
-                len(grouped_layers),
+                "Mooncake layerwise send layers=%s-%s count=%s descs=%s "
+                "prefill_done=%s transfer_id=%s req_id=%s",
+                pending_indices[0],
+                pending_indices[-1],
+                len(pending_indices),
                 len(grouped_src),
                 bool(session.get("prefill_done")),
+                transfer_id,
+                session["p_req_id"] or send_meta.p_req_id,
             )
             future = self.sender_loop.run_in_executor(
                 self._sender_executor,
