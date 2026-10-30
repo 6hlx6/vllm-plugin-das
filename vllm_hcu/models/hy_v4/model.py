@@ -521,6 +521,97 @@ class HYV4DecoderLayer(nn.Module):
         return hidden_states, None
 
 
+def _hcu_hyv4_resolve_topk_buffer(model):
+    """Return the live top-k buffer on this module or its inner model."""
+    buffer = getattr(model, "topk_indices_buffer", None)
+    if buffer is not None:
+        return buffer
+    inner = getattr(model, "model", None)
+    return getattr(inner, "topk_indices_buffer", None) if inner is not None else None
+
+
+def _hcu_hyv4_intermediate_dict(intermediate_tensors):
+    """Return the writable intermediate-tensor mapping."""
+    if intermediate_tensors is None:
+        return None
+    tensors = getattr(intermediate_tensors, "tensors", None)
+    if isinstance(tensors, dict):
+        return tensors
+    data = getattr(intermediate_tensors, "data", None)
+    if isinstance(data, dict):
+        return data
+    if isinstance(intermediate_tensors, dict):
+        return intermediate_tensors
+    return None
+
+
+def _hcu_hyv4_sync_topk_from_pp(model, intermediate_tensors) -> None:
+    """Copy incoming PP top-k into the local live buffer."""
+    tensors = _hcu_hyv4_intermediate_dict(intermediate_tensors)
+    if tensors is None:
+        return
+    incoming = tensors.get("topk_indices_buffer")
+    buffer = _hcu_hyv4_resolve_topk_buffer(model)
+    if incoming is None or buffer is None:
+        return
+    num_tokens = min(incoming.shape[0], buffer.shape[0])
+    buffer[:num_tokens].copy_(incoming[:num_tokens], non_blocking=True)
+
+
+def _hcu_hyv4_append_topk_to_pp(model, intermediate_tensors) -> None:
+    """Attach the live top-k buffer to outgoing PP tensors."""
+    tensors = _hcu_hyv4_intermediate_dict(intermediate_tensors)
+    buffer = _hcu_hyv4_resolve_topk_buffer(model)
+    if tensors is None or buffer is None:
+        return
+    hidden = tensors.get("hidden_states")
+    num_tokens = hidden.shape[0] if hidden is not None else buffer.shape[0]
+    topk = buffer[:num_tokens]
+    get_forward_context = None
+    try:
+        from vllm.forward_context import get_forward_context as _get_forward_context
+    except ImportError:
+        _get_forward_context = None
+    else:
+        get_forward_context = _get_forward_context
+    if get_forward_context is not None:
+        try:
+            from vllm.forward_context import is_forward_context_available
+        except ImportError:
+            def is_forward_context_available() -> bool:
+                return True
+
+        if is_forward_context_available():
+            ctx = get_forward_context()
+            if getattr(ctx, "enable_lightly_cp", False):
+                from vllm.distributed.parallel_state import get_tp_group
+
+                topk = get_tp_group().all_gather(topk.contiguous(), dim=0)
+    tensors["topk_indices_buffer"] = topk.clone()
+
+
+def _hcu_hyv4_wrap_make_empty(orig_empty):
+    """Reserve a top-k slot in empty PP intermediate tensors."""
+    if getattr(orig_empty, "_hcu_hyv4_pp_topk_wrapped", False):
+        return orig_empty
+
+    def _wrapped(batch_size, dtype, device, *args, **kwargs):
+        result = orig_empty(batch_size, dtype, device, *args, **kwargs)
+        model = getattr(_wrapped, "_hcu_hyv4_owner", None)
+        buffer = _hcu_hyv4_resolve_topk_buffer(model) if model is not None else None
+        tensors = _hcu_hyv4_intermediate_dict(result)
+        if buffer is not None and tensors is not None and "topk_indices_buffer" not in tensors:
+            tensors["topk_indices_buffer"] = torch.zeros(
+                (int(batch_size), int(buffer.shape[-1])),
+                dtype=torch.int32,
+                device=device,
+            )
+        return result
+
+    _wrapped._hcu_hyv4_pp_topk_wrapped = True
+    return _wrapped
+
+
 class HYV4Model(nn.Module, MixtureOfExperts):
     """HY V4 backbone."""
 
@@ -609,6 +700,9 @@ class HYV4Model(nn.Module, MixtureOfExperts):
                     ["hidden_states", "residual"], config.hidden_size
                 )
             )
+        wrapped_empty = _hcu_hyv4_wrap_make_empty(self.make_empty_intermediate_tensors)
+        wrapped_empty._hcu_hyv4_owner = self
+        self.make_empty_intermediate_tensors = wrapped_empty
 
         # MoE hyperparameters (consumed by EPLB).
         self.expert_weights: MutableSequence[Sequence[torch.Tensor]] = []
@@ -712,6 +806,8 @@ class HYV4Model(nn.Module, MixtureOfExperts):
             residual = None
         else:
             assert intermediate_tensors is not None
+            # Restore sparse top-k sent by the previous PP stage.
+            _hcu_hyv4_sync_topk_from_pp(self, intermediate_tensors)
             hidden_states = intermediate_tensors["hidden_states"]
             # In iHC mode the flattened [num_tokens, hc*h] tensor from the
             # previous PP stage is reshaped back to 3D by the first layer's
@@ -725,10 +821,13 @@ class HYV4Model(nn.Module, MixtureOfExperts):
             if self.enable_ihc:
                 # hidden_states is [num_tokens, hc, h]; flatten the channel dim
                 # for PP transfer (matches the 2D receive buffer).
-                return IntermediateTensors({"hidden_states": hidden_states.flatten(1)})
-            return IntermediateTensors(
-                {"hidden_states": hidden_states, "residual": residual}
-            )
+                output = IntermediateTensors({"hidden_states": hidden_states.flatten(1)})
+            else:
+                output = IntermediateTensors(
+                    {"hidden_states": hidden_states, "residual": residual}
+                )
+            _hcu_hyv4_append_topk_to_pp(self, output)
+            return output
         if self.enable_ihc:
             hidden_states = self.hc_head(hidden_states)
         else:

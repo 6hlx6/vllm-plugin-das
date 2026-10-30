@@ -200,8 +200,8 @@ def test_hy4_pp2_stage_41_starts_with_local_sparse_indexer_producer() -> None:
     )
 
     require_local_indexer_producer(config, start_layer=41, end_layer=78)
-    with pytest.raises(ValueError, match="preceding local 'full'"):
-        require_local_indexer_producer(config, start_layer=40, end_layer=78)
+    # Top-k crosses PP, so a stage may start on a shared indexer.
+    require_local_indexer_producer(config, start_layer=40, end_layer=78)
 
 
 def test_hy4_dcp_sparse_e4m3_cache_spec_keeps_tp8_page_geometry():
@@ -604,3 +604,70 @@ def test_hyv4_uses_target_sparse_mqa_implementation():
         HYV4FlashMLASparseImpl.forward_mqa
         is not HcuFlashMLASparseImpl.forward_mqa
     )
+
+
+def test_first_pp_stage_still_rejects_a_shared_indexer_start() -> None:
+    from vllm_hcu.models.hy_v4.attention import require_local_indexer_producer
+
+    config = SimpleNamespace(
+        index_topk=64,
+        num_hidden_layers=4,
+        index_topk_pattern="SFFF",
+    )
+    with pytest.raises(ValueError, match="top-k indices are not transferred"):
+        require_local_indexer_producer(config, start_layer=0, end_layer=4)
+    require_local_indexer_producer(config, start_layer=1, end_layer=4)
+
+
+def test_pp_topk_is_copied_through_intermediate_tensors(monkeypatch) -> None:
+    from vllm_hcu.models.hy_v4 import model as hy_model
+
+    class _NoLightlyCP:
+        enable_lightly_cp = False
+
+    monkeypatch.setattr(
+        "vllm.forward_context.get_forward_context",
+        lambda: _NoLightlyCP(),
+        raising=False,
+    )
+    live = torch.arange(8, dtype=torch.int32).reshape(2, 4)
+    producer = SimpleNamespace(topk_indices_buffer=live.clone())
+    outgoing = {"hidden_states": torch.zeros(2, 1)}
+    hy_model._hcu_hyv4_append_topk_to_pp(producer, outgoing)
+    restored = torch.zeros_like(live)
+    consumer = SimpleNamespace(topk_indices_buffer=restored)
+    hy_model._hcu_hyv4_sync_topk_from_pp(consumer, outgoing)
+    assert torch.equal(restored, live)
+
+
+def test_pp_topk_all_gather_errors_are_not_swallowed(monkeypatch) -> None:
+    from vllm_hcu.models.hy_v4 import model as hy_model
+
+    class _LightlyCP:
+        enable_lightly_cp = True
+
+    class _TpGroup:
+        def all_gather(self, tensor, dim=0):
+            del tensor, dim
+            raise RuntimeError("all_gather failed")
+
+    monkeypatch.setattr(
+        "vllm.forward_context.get_forward_context",
+        lambda: _LightlyCP(),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "vllm.forward_context.is_forward_context_available",
+        lambda: True,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.get_tp_group",
+        lambda: _TpGroup(),
+        raising=False,
+    )
+    live = torch.arange(4, dtype=torch.int32).reshape(1, 4)
+    producer = SimpleNamespace(topk_indices_buffer=live)
+    outgoing = {"hidden_states": torch.zeros(1, 1)}
+    with pytest.raises(RuntimeError, match="all_gather failed"):
+        hy_model._hcu_hyv4_append_topk_to_pp(producer, outgoing)

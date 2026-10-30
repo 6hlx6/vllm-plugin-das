@@ -347,6 +347,150 @@ def _get_pp_stage_layer_range(
     return get_pp_indices(num_layers, pp_rank, pp_size)
 
 
+def _pp_partition_string(partition: str | None) -> str:
+    """Normalize a PP partition; an empty string means an even split."""
+    if not partition:
+        return ""
+    return ",".join(part.strip() for part in str(partition).split(",") if part.strip())
+
+
+def _pp_stage_range(
+    num_layers: int,
+    pp_rank: int,
+    pp_size: int,
+    partition: str | None = None,
+) -> tuple[int, int]:
+    """Return one PP stage range. ``pp_size == 1`` covers every layer.
+
+    An even split uses ``_get_pp_stage_layer_range``, matching KV registration.
+    An explicit partition is applied to the given ``pp_size``, not this process.
+    """
+    pp_size = max(int(pp_size), 1)
+    num_layers = int(num_layers)
+    pp_rank = int(pp_rank)
+    if pp_size == 1:
+        return 0, num_layers
+    if not 0 <= pp_rank < pp_size:
+        raise RuntimeError(f"pp_rank={pp_rank} is outside pp_size={pp_size}.")
+    normalized = _pp_partition_string(partition)
+    if not normalized:
+        return _get_pp_stage_layer_range(num_layers, pp_rank, pp_size)
+    try:
+        counts = _normalize_pp_layer_partition(normalized, num_layers, pp_size)
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
+    start = sum(counts[:pp_rank])
+    return start, start + counts[pp_rank]
+
+
+def _cache_type_sort_key(layer_name: str) -> int:
+    """Sort indexer cache before MLA/FA within the same layer."""
+    if layer_name.endswith(".indexer") or ".indexer." in layer_name:
+        return 0
+    return 1
+
+
+def _select_cache_entry_indices(
+    layer_names: list[str],
+    layer_indices: list[int],
+    *,
+    model_layer_start: int = -1,
+    model_layer_end: int = -1,
+) -> list[int]:
+    """Select cache rows in a layer range, with indexer entries first."""
+    if model_layer_start >= 0:
+        selected = [
+            index
+            for index, layer_idx in enumerate(layer_indices)
+            if model_layer_start <= layer_idx < model_layer_end
+        ]
+    else:
+        selected = list(range(len(layer_names)))
+    selected.sort(
+        key=lambda index: (
+            layer_indices[index],
+            _cache_type_sort_key(layer_names[index]),
+            index,
+        )
+    )
+    return selected
+
+
+def _take_cache_entries(values_list: list, indices: list[int]):
+    return [values_list[index] for index in indices]
+
+
+def _filter_registered_cache_entries(
+    *,
+    base_addrs: list[int],
+    block_lens: list[int],
+    kv_block_lens: list[int],
+    layer_names: list[str],
+    layer_indices: list[int],
+    group_indices: list[int],
+    num_blocks: list[int] | None,
+    model_layer_start: int,
+    model_layer_end: int,
+):
+    """Keep overlapping layers for heterogeneous PP; otherwise keep registration order."""
+    if model_layer_start < 0:
+        return (
+            base_addrs,
+            block_lens,
+            kv_block_lens,
+            layer_names,
+            layer_indices,
+            group_indices,
+            num_blocks,
+        )
+    keep = _select_cache_entry_indices(
+        layer_names,
+        layer_indices,
+        model_layer_start=model_layer_start,
+        model_layer_end=model_layer_end,
+    )
+    filtered_blocks = (
+        _take_cache_entries(num_blocks, keep) if num_blocks is not None else None
+    )
+    return (
+        _take_cache_entries(base_addrs, keep),
+        _take_cache_entries(block_lens, keep),
+        _take_cache_entries(kv_block_lens, keep),
+        _take_cache_entries(layer_names, keep),
+        _take_cache_entries(layer_indices, keep),
+        _take_cache_entries(group_indices, keep),
+        filtered_blocks,
+    )
+
+
+def _validate_mooncake_pcp_pd(vllm_config: VllmConfig) -> None:
+    """Allow PCP only for a kv_producer replica. Reject D-side PCP, DCP, and bidirectional KV."""
+    parallel_config = vllm_config.parallel_config
+    kv_transfer_config = vllm_config.kv_transfer_config
+    if parallel_config is None or kv_transfer_config is None:
+        return
+    pcp_size = int(getattr(parallel_config, "prefill_context_parallel_size", 1) or 1)
+    if pcp_size <= 1:
+        return
+    kv_role = getattr(kv_transfer_config, "kv_role", None)
+    dcp_size = int(getattr(parallel_config, "decode_context_parallel_size", 1) or 1)
+    extra = getattr(kv_transfer_config, "kv_connector_extra_config", None) or {}
+    if kv_role in ("kv_consumer", "kv_both"):
+        raise NotImplementedError(
+            "MooncakeConnector PCP currently supports kv_producer only. "
+            "Consumers and kv_both require prefill_context_parallel_size=1."
+        )
+    if dcp_size > 1:
+        raise NotImplementedError(
+            "MooncakeConnector PCP producers currently require "
+            "decode_context_parallel_size=1."
+        )
+    if extra.get("bidirectional_kv_xfer"):
+        raise NotImplementedError(
+            "MooncakeConnector PCP producers do not support bidirectional KV transfer."
+        )
+
+
 def _valid_block_capacities(counts: list[int], region_count: int) -> bool:
     return len(counts) == region_count and all(
         type(count) is int and count > 0 for count in counts
@@ -798,6 +942,12 @@ class MooncakeXferMetadata(
     registered_layer_indices: list[int] = msgspec.field(default_factory=list)
     registered_group_indices: list[int] = msgspec.field(default_factory=list)
     num_blocks_per_layer: list[int] = msgspec.field(default_factory=list)
+    # Consumer layer range. -1 keeps rank pairing for homogeneous PP.
+    model_layer_start: int = -1
+    model_layer_end: int = -1
+    remote_pp_size: int = 1
+    # Consumer partition. Empty means an even split; pp1 still echoes the pp>1 side.
+    pp_layer_partition: str = ""
 
 
 class MooncakeXferResponseStatus(IntEnum):
@@ -886,6 +1036,7 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         assert vllm_config.kv_transfer_config is not None
         assert vllm_config.kv_transfer_config.engine_id is not None
         self.engine_id: EngineId = vllm_config.kv_transfer_config.engine_id
+        _validate_mooncake_pcp_pd(vllm_config)
 
         if role == KVConnectorRole.SCHEDULER:
             assert kv_cache_config is not None, (
@@ -1710,6 +1861,14 @@ class MooncakeConnectorWorker:
             )
             await reject_metadata(msg)
             return
+        try:
+            self._reject_custom_partition_for_hetero_pp(
+                getattr(meta, "remote_pp_size", 1) or 1,
+                remote_partition=getattr(meta, "pp_layer_partition", "") or "",
+            )
+        except (RuntimeError, ValueError) as exc:
+            await reject_metadata(str(exc))
+            return
         has_transfer_blocks = any(
             any(group for group in block_groups)
             for _, block_groups in meta.req_blocks.values()
@@ -1730,14 +1889,41 @@ class MooncakeConnectorWorker:
             if metadata_err is not None:
                 await reject_metadata(metadata_err)
                 return
+        layer_start = int(getattr(meta, "model_layer_start", -1))
+        layer_end = int(getattr(meta, "model_layer_end", -1))
+        (
+            local_base_addrs,
+            local_block_lens,
+            local_kv_block_lens,
+            local_layer_names,
+            local_layer_indices,
+            local_group_indices,
+            local_num_blocks,
+        ) = _filter_registered_cache_entries(
+            base_addrs=self.kv_caches_base_addr,
+            block_lens=self.block_len_per_layer,
+            kv_block_lens=self.kv_block_len_per_layer,
+            layer_names=self.registered_layer_names,
+            layer_indices=self.registered_layer_indices,
+            group_indices=self.registered_group_indices,
+            num_blocks=self.num_blocks_per_layer,
+            model_layer_start=layer_start,
+            model_layer_end=layer_end,
+        )
+        if layer_start >= 0 and not local_layer_names:
+            await reject_metadata(
+                "Mooncake heterogeneous PP overlap contains no producer KV layers "
+                f"in [{layer_start}, {layer_end})."
+            )
+            return
         local_regions = self._get_transfer_regions(
-            self.kv_caches_base_addr,
-            self.block_len_per_layer,
-            self.kv_block_len_per_layer,
-            self.registered_layer_names,
-            self.registered_layer_indices,
-            self.registered_group_indices,
-            num_blocks_per_layer=self.num_blocks_per_layer,
+            local_base_addrs,
+            local_block_lens,
+            local_kv_block_lens,
+            local_layer_names,
+            local_layer_indices,
+            local_group_indices,
+            num_blocks_per_layer=local_num_blocks,
         )
         remote_regions = self._get_transfer_regions(
             meta.kv_caches_base_addr,
@@ -1816,6 +2002,8 @@ class MooncakeConnectorWorker:
                 else MooncakeXferResponseStatus.FINISH
             )
             ready_reqs: list[tuple[ReqId, SendBlockMeta]] = []
+            resolve_err_reqs: list[ReqId] = []
+            resolve_err_msg: str | None = None
             for task in done:
                 d_req_id, send_meta = task.result()
                 del pending_reqs[d_req_id]
@@ -1823,8 +2011,25 @@ class MooncakeConnectorWorker:
                 if send_meta.transfer_id in self.reqs_need_send:
                     # Mark it sending to avoid expiration.
                     send_meta.sending += 1
-                    if not send_meta.need_send:
-                        self.resolve_need_send(send_meta, remote_tp_ranks)
+                    try:
+                        if not send_meta.need_send:
+                            self.resolve_need_send(
+                                send_meta,
+                                remote_tp_ranks,
+                                remote_pp_size=getattr(meta, "remote_pp_size", 1) or 1,
+                                remote_partition=getattr(meta, "pp_layer_partition", "")
+                                or "",
+                            )
+                    except (RuntimeError, ValueError) as exc:
+                        send_meta.sending -= 1
+                        logger.error(
+                            "Mooncake resolve_need_send failed for %s: %s",
+                            d_req_id,
+                            exc,
+                        )
+                        resolve_err_reqs.append(d_req_id)
+                        resolve_err_msg = str(exc)
+                        continue
                     ready_reqs.append((d_req_id, send_meta))
                 else:
                     # Otherwise (expired, very unlikely), just forget it.
@@ -1845,6 +2050,12 @@ class MooncakeConnectorWorker:
                 remote_regions,
             )
             err_req_set = set(err_reqs)
+            if resolve_err_reqs:
+                err_reqs = list(err_reqs) + resolve_err_reqs
+                err_req_set.update(resolve_err_reqs)
+                err_msg = (
+                    resolve_err_msg if err_msg is None else f"{err_msg}; {resolve_err_msg}"
+                )
             ok_ready_reqs = [
                 (d_req_id, send_meta)
                 for d_req_id, send_meta in ready_reqs
@@ -1910,18 +2121,102 @@ class MooncakeConnectorWorker:
             )
             await sock.send_multipart((identity, self._encoder.encode(response)))
 
+    def _reject_custom_partition_for_hetero_pp(
+        self,
+        remote_pp_size: int,
+        remote_partition: str | None = None,
+    ) -> None:
+        """Validate PP partitions before a layer-overlap transfer.
+
+        Same PP: partition strings must match, then ranks still pair.
+        ppN to pp1: custom partitions are allowed when the strings match.
+        Both PP sizes above 1 and unequal: custom partitions are rejected.
+        """
+        local = _pp_partition_string(getattr(envs, "VLLM_PP_LAYER_PARTITION", None))
+        remote_pp_size = max(int(remote_pp_size), 1)
+        local_pp_size = int(self.pp_size)
+        same_pp = remote_pp_size == local_pp_size
+        pp1_hetero = min(local_pp_size, remote_pp_size) == 1
+        if remote_partition is None:
+            if same_pp or not local or pp1_hetero:
+                return
+            raise RuntimeError(
+                "Mooncake heterogeneous PP does not support "
+                "VLLM_PP_LAYER_PARTITION when both PP sizes are >1; "
+                "unset it so both sides use the default even split."
+            )
+        remote = _pp_partition_string(remote_partition)
+        if same_pp:
+            if local == remote:
+                return
+            raise RuntimeError(
+                "Mooncake same-PP P/D requires matching "
+                "VLLM_PP_LAYER_PARTITION "
+                f"(local={local!r} remote={remote!r})."
+            )
+        if pp1_hetero:
+            if local == remote:
+                return
+            raise RuntimeError(
+                "Mooncake heterogeneous PP (ppN-pp1) requires matching "
+                "VLLM_PP_LAYER_PARTITION "
+                f"(local={local!r} remote={remote!r})."
+            )
+        if local or remote:
+            raise RuntimeError(
+                "Mooncake heterogeneous PP does not support "
+                "VLLM_PP_LAYER_PARTITION when both PP sizes are >1; "
+                "unset it on both sides."
+            )
+
+    def _count_overlapping_remote_pp_stages(
+        self,
+        remote_pp_size: int,
+        remote_partition: str | None = None,
+    ) -> int:
+        """Count remote PP stages that overlap this producer's layers."""
+        remote_pp_size = max(int(remote_pp_size), 1)
+        self._reject_custom_partition_for_hetero_pp(
+            remote_pp_size, remote_partition=remote_partition
+        )
+        if remote_pp_size == 1 or self.pp_size <= 0:
+            return remote_pp_size
+        total_model_layers = self.model_config.get_total_num_hidden_layers()
+        local_part = getattr(envs, "VLLM_PP_LAYER_PARTITION", None)
+        remote_part = remote_partition if remote_partition is not None else local_part
+        p_start, p_end = _pp_stage_range(
+            total_model_layers, self.pp_rank, self.pp_size, local_part
+        )
+        overlap = 0
+        for d_pp_rank in range(remote_pp_size):
+            d_start, d_end = _pp_stage_range(
+                total_model_layers, d_pp_rank, remote_pp_size, remote_part
+            )
+            if d_start >= p_end or p_start >= d_end:
+                continue
+            overlap += 1
+        return max(overlap, 1)
+
     def resolve_need_send(
         self,
         send_meta: SendBlockMeta,
         remote_tp_ranks: list[int],
+        remote_pp_size: int = 1,
+        remote_partition: str | None = None,
     ):
-        # Prepare for heterogeneous TP (one P pairs to multiple D)
-        send_meta.need_send = len(remote_tp_ranks)
+        # Heterogeneous TP still counts paired remote ranks, then overlapping PP stages.
+        pp_contacts = self._count_overlapping_remote_pp_stages(
+            remote_pp_size, remote_partition=remote_partition
+        )
+        send_meta.need_send = len(remote_tp_ranks) * pp_contacts
         logger.debug(
-            "Mooncake request %s will be served by %d consumer TP workers: TP ranks=%s",
+            "Mooncake request %s will be served by %d consumer contacts "
+            "(tp_ranks=%s pp_contacts=%d remote_pp_size=%d)",
             send_meta.transfer_id,
             send_meta.need_send,
             remote_tp_ranks,
+            pp_contacts,
+            remote_pp_size,
         )
 
     def _logical_to_kernel_block_ids(
@@ -2360,6 +2655,31 @@ class MooncakeConnectorWorker:
                 kv_data_ptrs.append(storage_addr)
                 kv_data_lens.append(storage_len)
 
+        # Keep indexer before MLA so both sides share one layer order.
+        indexer_order = _select_cache_entry_indices(
+            self.registered_layer_names,
+            self.registered_layer_indices,
+        )
+        region_base_addresses = _take_cache_entries(region_base_addresses, indexer_order)
+        self.block_len_per_layer = _take_cache_entries(
+            self.block_len_per_layer, indexer_order
+        )
+        self.kv_block_len_per_layer = _take_cache_entries(
+            self.kv_block_len_per_layer, indexer_order
+        )
+        self.registered_layer_names = _take_cache_entries(
+            self.registered_layer_names, indexer_order
+        )
+        self.registered_layer_indices = _take_cache_entries(
+            self.registered_layer_indices, indexer_order
+        )
+        self.registered_group_indices = _take_cache_entries(
+            self.registered_group_indices, indexer_order
+        )
+        self.num_blocks_per_layer = _take_cache_entries(
+            self.num_blocks_per_layer, indexer_order
+        )
+
         self.kv_caches_base_addr = region_base_addresses
         self.seen_base_addresses = kv_data_ptrs
 
@@ -2379,6 +2699,15 @@ class MooncakeConnectorWorker:
 
         # No need to launch server for D node.
         if self.is_kv_consumer:
+            return
+        # Replicated PCP listens only on rank 0. Layer-split ranks still send their layers.
+        if getattr(self, "_pcp_dummy_sender", False):
+            logger.info(
+                "Mooncake PCP replica skip listen: pcp_rank=%s "
+                "pcp_size=%s (rank0 sends the KV replica)",
+                self.pcp_rank,
+                self.pcp_size,
+            )
             return
 
         ready_event = threading.Event()
@@ -2469,8 +2798,30 @@ class MooncakeConnectorWorker:
         self,
         worker_addr: str,
         pull_metas: dict[ReqId, PullReqMeta],
+        *,
+        model_layer_start: int = -1,
+        model_layer_end: int = -1,
     ):
         req_ids = set(pull_metas)
+        (
+            base_addrs,
+            block_lens,
+            kv_block_lens,
+            layer_names,
+            layer_indices,
+            group_indices,
+            num_blocks,
+        ) = _filter_registered_cache_entries(
+            base_addrs=self.kv_caches_base_addr,
+            block_lens=self.block_len_per_layer,
+            kv_block_lens=self.kv_block_len_per_layer,
+            layer_names=self.registered_layer_names,
+            layer_indices=self.registered_layer_indices,
+            group_indices=self.registered_group_indices,
+            num_blocks=self.num_blocks_per_layer,
+            model_layer_start=model_layer_start,
+            model_layer_end=model_layer_end,
+        )
         metadata = MooncakeXferMetadata(
             remote_hostname=self.hostname,
             remote_port=self.rpc_port,
@@ -2480,13 +2831,19 @@ class MooncakeConnectorWorker:
                 req_id: (pull_meta.transfer_id, pull_meta.local_block_ids)
                 for req_id, pull_meta in pull_metas.items()
             },
-            kv_caches_base_addr=self.kv_caches_base_addr,
-            block_lens=self.block_len_per_layer,
-            kv_block_lens=self.kv_block_len_per_layer,
-            registered_layer_names=self.registered_layer_names,
-            registered_layer_indices=self.registered_layer_indices,
-            registered_group_indices=self.registered_group_indices,
-            num_blocks_per_layer=self.num_blocks_per_layer,
+            kv_caches_base_addr=base_addrs,
+            block_lens=block_lens,
+            kv_block_lens=kv_block_lens,
+            registered_layer_names=layer_names,
+            registered_layer_indices=layer_indices,
+            registered_group_indices=group_indices,
+            num_blocks_per_layer=num_blocks or [],
+            model_layer_start=model_layer_start,
+            model_layer_end=model_layer_end,
+            remote_pp_size=self.pp_size,
+            pp_layer_partition=_pp_partition_string(
+                getattr(envs, "VLLM_PP_LAYER_PARTITION", None)
+            ),
         )
 
         encoded_data = self._encoder.encode(metadata)
@@ -2650,18 +3007,42 @@ class MooncakeConnectorWorker:
                 ]
         else:
             virtual_ranks = remote_tp_ranks
-        worker_addrs: list[str] = []
+        worker_jobs: list[tuple[str, int, int]] = []
         selected_remote_pp: dict[int, list[int]] = {}
-        for remote_tp_rank in virtual_ranks:
-            pp_to_addr = self._remote_agents[remote_engine_id][remote_tp_rank]
-            if self.pp_size == len(pp_to_addr) and self.pp_rank in pp_to_addr:
-                pp_ranks = [self.pp_rank]
-            else:
-                pp_ranks = sorted(pp_to_addr)
-            selected_remote_pp[remote_tp_rank] = pp_ranks
-            worker_addrs.extend(pp_to_addr[pp_rank] for pp_rank in pp_ranks)
+        try:
+            for remote_tp_rank in virtual_ranks:
+                pp_to_addr = self._remote_agents[remote_engine_id][remote_tp_rank]
+                remote_pp_size = len(pp_to_addr)
+                same_pp = (
+                    self.pp_size == remote_pp_size and self.pp_rank in pp_to_addr
+                )
+                if same_pp:
+                    pp_ranks = [self.pp_rank]
+                else:
+                    self._reject_custom_partition_for_hetero_pp(remote_pp_size)
+                    pp_ranks = self._overlapping_remote_pp_ranks(
+                        remote_pp_size, sorted(pp_to_addr)
+                    )
+                selected_remote_pp[remote_tp_rank] = pp_ranks
+                for pp_rank in pp_ranks:
+                    if same_pp:
+                        worker_jobs.append((pp_to_addr[pp_rank], -1, -1))
+                        continue
+                    overlap_start, overlap_end = self._pp_overlap_layer_range(
+                        remote_pp_rank=pp_rank,
+                        remote_pp_size=remote_pp_size,
+                    )
+                    if overlap_start >= overlap_end:
+                        continue
+                    worker_jobs.append(
+                        (pp_to_addr[pp_rank], overlap_start, overlap_end)
+                    )
+        except (RuntimeError, ValueError) as exc:
+            # A bad PP partition on this background path must finish the pull.
+            self._fail_pull_metas(pull_metas, str(exc))
+            return
 
-        count = len(worker_addrs)
+        count = len(worker_jobs)
         logger.debug(
             "Receiving Mooncake KV for engine %s from producer virtual TP "
             "ranks %s (pcp_size=%d, layer_split=%s) and PP ranks %s",
@@ -2671,11 +3052,22 @@ class MooncakeConnectorWorker:
             remote_layer_split,
             selected_remote_pp,
         )
+        if count == 0:
+            self._fail_pull_metas(
+                pull_metas,
+                f"asymmetric PP has zero overlap tasks for engine {remote_engine_id}",
+            )
+            return
         for pull_meta in pull_metas.values():
             pull_meta.pull_tasks_count = count
-        for worker_addr in worker_addrs:
+        for worker_addr, layer_start, layer_end in worker_jobs:
             asyncio.create_task(
-                self.receive_kv_from_single_worker(worker_addr, pull_metas)
+                self.receive_kv_from_single_worker(
+                    worker_addr,
+                    pull_metas,
+                    model_layer_start=layer_start,
+                    model_layer_end=layer_end,
+                )
             )
 
     async def handle_new_engine_id(
@@ -2767,6 +3159,35 @@ class MooncakeConnectorWorker:
 
     def _producer_cache_is_replicated(self) -> bool:
         return self.transfer_topo.local_replicates_kv_cache
+
+    def _pp_overlap_layer_range(
+        self, *, remote_pp_rank: int, remote_pp_size: int
+    ) -> tuple[int, int]:
+        """Layer overlap ``[start, end)`` with one remote PP stage."""
+        self._reject_custom_partition_for_hetero_pp(remote_pp_size)
+        total_model_layers = self.model_config.get_total_num_hidden_layers()
+        local_part = getattr(envs, "VLLM_PP_LAYER_PARTITION", None)
+        d_start, d_end = _pp_stage_range(
+            total_model_layers, self.pp_rank, self.pp_size, local_part
+        )
+        p_start, p_end = _pp_stage_range(
+            total_model_layers, remote_pp_rank, remote_pp_size, local_part
+        )
+        return max(d_start, p_start), min(d_end, p_end)
+
+    def _overlapping_remote_pp_ranks(
+        self, remote_pp_size: int, remote_pp_ranks: list[int]
+    ) -> list[int]:
+        selected: list[int] = []
+        for pp_rank in remote_pp_ranks:
+            start, end = self._pp_overlap_layer_range(
+                remote_pp_rank=pp_rank,
+                remote_pp_size=remote_pp_size,
+            )
+            if start >= end:
+                continue
+            selected.append(pp_rank)
+        return selected
 
     def _get_transfer_regions(
         self,
