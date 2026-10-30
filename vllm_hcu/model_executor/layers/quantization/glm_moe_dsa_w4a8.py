@@ -64,22 +64,28 @@ def glm_expert_weights_use_gemm2_layout(layer: torch.nn.Module) -> bool:
 
 
 def commit_installed_glm_w4a8_gemm2_generation(layer: torch.nn.Module) -> None:
-    """Point the gemm2 marker at the parameters that own the converted bytes.
+    """Refresh installed GLM layout metadata and runtime scale owners.
 
     Checkpoint reload records the marker on the temporary materialized
     Parameter, then copies those bytes back onto the original runtime
     Parameter. Kernel-format reload copies into that same Parameter and
     bumps its version. Rebind the existing quant config to the installed
     scale owners as well, preserving references held by the execution path.
-    Neither path may run gemm2 repack again.
+    The native fallback also needs its scale owners rebound after reload,
+    although its unpacked weights have no gemm2 marker. Neither path may
+    run gemm2 repack again.
     """
-    if not getattr(layer, _GLM_W4A8_GEMM2_GENERATION, None):
+    if getattr(layer, _GLM_W4A8_GEMM2_GENERATION, None):
+        generation = _expert_weight_generation(layer)
+        if not generation:
+            return
+        setattr(layer, _GLM_W4A8_GEMM2_GENERATION, generation)
+        layer._glm_w4a8_gemm2_shuffled = True
+    elif not all(
+        getattr(getattr(layer, name, None), "_hcu_vllm_w4a8_unpacked", False)
+        for name in _GLM_EXPERT_WEIGHTS
+    ):
         return
-    generation = _expert_weight_generation(layer)
-    if not generation:
-        return
-    setattr(layer, _GLM_W4A8_GEMM2_GENERATION, generation)
-    layer._glm_w4a8_gemm2_shuffled = True
     method = getattr(layer, "quant_method", None)
     if isinstance(method, GlmMoeDsaW4A8MoEMethod):
         quant_config = getattr(method, "moe_quant_config", None)

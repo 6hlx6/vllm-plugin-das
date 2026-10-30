@@ -238,6 +238,35 @@ def _selection_config(**overrides: object) -> SimpleNamespace:
     return config
 
 
+@pytest.mark.parametrize("symmetric", ["omitted", True, False, None])
+@pytest.mark.parametrize("args_as_objects", [False, True])
+def test_int4_weight_symmetry_defaults_only_when_omitted(
+    symmetric, args_as_objects
+) -> None:
+    from vllm_hcu.model_executor.layers.quantization.glm_channel_int4 import (
+        routed_expert_uses_glm_channel_int4,
+    )
+
+    quant = _quant_config()
+    group = quant["config_groups"]["group_int4"]
+    if symmetric == "omitted":
+        del group["weights"]["symmetric"]
+    else:
+        group["weights"]["symmetric"] = symmetric
+    if args_as_objects:
+        group["weights"] = SimpleNamespace(**group["weights"])
+        group["input_activations"] = SimpleNamespace(**group["input_activations"])
+    expected = symmetric == "omitted" or symmetric is True
+    assert is_glm_channel_int4_w4a8(quant, _glm_hf_config()) is expected
+    assert GlmMoeDsaW4A8Facade.override_quantization_method(
+        quant, None, _glm_hf_config()
+    ) == ("glm_moe_dsa_w4a8" if expected else None)
+    config = _selection_config(target_scheme_map={group["targets"][0]: group})
+    assert routed_expert_uses_glm_channel_int4(
+        config, SimpleNamespace(), "model.layers.0.mlp.experts"
+    ) is expected
+
+
 @pytest.mark.parametrize("symmetric", [None, True, False])
 @pytest.mark.parametrize("args_as_objects", [False, True])
 def test_int4_activation_symmetry_is_respected(symmetric, args_as_objects) -> None:
@@ -855,8 +884,10 @@ def test_glm_aiter_post_load_repacks_replaced_weights(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize("glm_method", [False, True])
-@pytest.mark.parametrize("gemm2_marked", [False, True])
-def test_reload_scale_refresh_is_scoped_to_glm_gemm2(glm_method, gemm2_marked):
+@pytest.mark.parametrize("installed_layout", [None, "gemm2", "native"])
+def test_reload_scale_refresh_is_scoped_to_glm_installed_layout(
+    glm_method, installed_layout
+):
     from vllm_hcu.model_executor.layers.quantization.glm_moe_dsa_w4a8 import (
         commit_installed_glm_w4a8_gemm2_generations,
     )
@@ -879,13 +910,16 @@ def test_reload_scale_refresh_is_scoped_to_glm_gemm2(glm_method, gemm2_marked):
     old_w2_scale = quant_config.w2_scale
     layer.w13_weight_scale = torch.nn.Parameter(torch.full((1,), 7.0), requires_grad=False)
     layer.w2_weight_scale = torch.nn.Parameter(torch.full((1,), 11.0), requires_grad=False)
-    if gemm2_marked:
+    if installed_layout == "gemm2":
         layer._glm_w4a8_gemm2_generation = ("previous owners",)
+    elif installed_layout == "native":
+        layer.w13_weight._hcu_vllm_w4a8_unpacked = True
+        layer.w2_weight._hcu_vllm_w4a8_unpacked = True
 
     commit_installed_glm_w4a8_gemm2_generations(layer)
 
     assert method.moe_quant_config is quant_config
-    if glm_method and gemm2_marked:
+    if glm_method and installed_layout is not None:
         assert quant_config.w1_scale is layer.w13_weight_scale
         assert quant_config.w2_scale is layer.w2_weight_scale
     else:
@@ -910,8 +944,9 @@ def _v2_reload_runner(model):
 
 
 @pytest.mark.parametrize("runner_kind", ["legacy", "v2"])
-def test_reload_weights_keeps_gemm2_generation_for_later_forward(
-    monkeypatch, runner_kind
+@pytest.mark.parametrize("installed_layout", ["gemm2", "native"])
+def test_reload_weights_keeps_scale_owners_for_later_forward(
+    monkeypatch, runner_kind, installed_layout
 ) -> None:
     from vllm.model_executor.model_loader.reload.layerwise import (
         record_metadata_for_reloading,
@@ -926,7 +961,14 @@ def test_reload_weights_keeps_gemm2_generation_for_later_forward(
     from vllm_hcu.model_executor.layers.quantization.slimquant_w4a8 import (
         SlimQuantW4A8Int8AiterMoEMethod,
     )
-    config = SimpleNamespace(need_shuffle=True, need_shuffle_scale=True)
+    gemm2 = installed_layout == "gemm2"
+    config = (
+        SimpleNamespace(
+            need_shuffle=True, need_shuffle_scale=True,
+            quant_type="w4a8", solution_type="moe_c",
+        )
+        if gemm2 else None
+    )
     parent_post_load = SlimQuantW4A8Int8AiterMoEMethod.process_weights_after_loading
     calls = _patch_glm_post_load(monkeypatch, config)
     # Keep the real quant-config construction and scale binding during reload.
@@ -935,27 +977,27 @@ def test_reload_weights_keeps_gemm2_generation_for_later_forward(
         "process_weights_after_loading",
         parent_post_load,
     )
-    config.quant_type = "w4a8"
-    config.solution_type = "moe_c"
     method, _layer = _glm_aiter_method("auto")
+    method.moe.activation = "silu"
+    method.moe.num_experts = 2
 
     class ExpertModel(torch.nn.Module):
         def __init__(self):
             super().__init__()
             self.quant_method = method
             self.w13_weight = torch.nn.Parameter(
-                torch.arange(32, dtype=torch.int8).reshape(2, 8, 2),
+                torch.zeros((2, 16, 4), dtype=torch.int8),
                 requires_grad=False,
             )
             self.w2_weight = torch.nn.Parameter(
-                torch.arange(16, dtype=torch.int8).reshape(2, 4, 2),
+                torch.zeros((2, 8, 4), dtype=torch.int8),
                 requires_grad=False,
             )
             self.w13_weight_scale = torch.nn.Parameter(
-                torch.ones((2, 8, 1)), requires_grad=False
+                torch.ones((2, 16, 1)), requires_grad=False
             )
             self.w2_weight_scale = torch.nn.Parameter(
-                torch.ones((2, 4, 1)), requires_grad=False
+                torch.ones((2, 8, 1)), requires_grad=False
             )
             self.register_parameter("w13_input_scale", None)
             self.register_parameter("w2_input_scale", None)
@@ -987,16 +1029,19 @@ def test_reload_weights_keeps_gemm2_generation_for_later_forward(
     # Native reload metadata describes checkpoint storage before post-load
     # installs kernel layout attributes on the runtime Parameters.
     record_metadata_for_reloading(model)
-    compressed_tensors_moe_runtime.install_aiter_moe_weight_layout(
-        model,
-        SimpleNamespace(
-            quant_type="w4a8",
-            solution_type="moe_c",
-            need_shuffle=False,
-            need_shuffle_scale=False,
-        ),
-        logical_shape=(2, 8, 4, 4),
-    )
+    if gemm2:
+        compressed_tensors_moe_runtime.install_aiter_moe_weight_layout(
+            model,
+            SimpleNamespace(
+                quant_type="w4a8",
+                solution_type="moe_c",
+                need_shuffle=False,
+                need_shuffle_scale=False,
+            ),
+            logical_shape=(2, 16, 8, 8),
+        )
+    else:
+        method.process_weights_after_loading(model)
     original_w13 = model.w13_weight
     original_w2 = model.w2_weight
     original_w13_scale = model.w13_weight_scale
@@ -1014,8 +1059,12 @@ def test_reload_weights_keeps_gemm2_generation_for_later_forward(
         )
         reload_weights = partial(GPUModelRunner.reload_weights, runner)
     checkpoint = [
-        ("w13_weight", torch.ones_like(original_w13)),
-        ("w2_weight", torch.ones_like(original_w2)),
+        ("w13_weight", _pack_compressed_tensors_int4(
+            torch.ones((2, 16, 8), dtype=torch.int8)
+        )),
+        ("w2_weight", _pack_compressed_tensors_int4(
+            torch.ones((2, 8, 8), dtype=torch.int8)
+        )),
         ("w13_weight_scale", torch.full_like(original_w13_scale, 32.0)),
         ("w2_weight_scale", torch.full_like(original_w2_scale, 48.0)),
     ]
@@ -1023,17 +1072,20 @@ def test_reload_weights_keeps_gemm2_generation_for_later_forward(
 
     assert model.w13_weight is original_w13
     assert model.w2_weight is original_w2
-    assert calls["repack"] == 2
-    assert glm_expert_weights_use_gemm2_layout(model)
-    assert torch.equal(model.w13_weight, torch.ones_like(original_w13) + 1)
+    assert calls["repack"] == (2 if gemm2 else 0)
+    assert glm_expert_weights_use_gemm2_layout(model) is gemm2
+    assert torch.equal(
+        model.w13_weight, torch.full_like(original_w13, 0x12 if gemm2 else 1)
+    )
     assert model.w13_weight_scale is original_w13_scale
     assert model.w2_weight_scale is original_w2_scale
     assert method.moe_quant_config.w1_scale is original_w13_scale
     assert method.moe_quant_config.w2_scale is original_w2_scale
-    calls_forward = _forward_reloaded_gemm2(monkeypatch, model)
-    assert calls_forward["execute"]["use_weight_shuffle"] is False
-    assert torch.all(calls_forward["execute"]["w1_scale"] == 2.0)
-    assert torch.all(calls_forward["execute"]["w2_scale"] == 3.0)
+    compensation = 1.0 if gemm2 else 16.0
+    calls_forward = _forward_reloaded_weights(monkeypatch, model)
+    assert not calls_forward["execute"].get("use_weight_shuffle", False)
+    assert torch.all(calls_forward["execute"]["w1_scale"] == 2.0 * compensation)
+    assert torch.all(calls_forward["execute"]["w2_scale"] == 3.0 * compensation)
     installed_quant_config = method.moe_quant_config
 
     kernel = [
@@ -1043,30 +1095,31 @@ def test_reload_weights_keeps_gemm2_generation_for_later_forward(
         ("w2_weight_scale", torch.full_like(original_w2_scale, 11.0)),
     ]
     reload_weights(iter(kernel), is_checkpoint_format=False)
-    assert calls["repack"] == 2
-    assert glm_expert_weights_use_gemm2_layout(model)
+    assert calls["repack"] == (2 if gemm2 else 0)
+    assert glm_expert_weights_use_gemm2_layout(model) is gemm2
     assert method.moe_quant_config is installed_quant_config
     for num_tokens in (1, 3):
-        calls_forward = _forward_reloaded_gemm2(monkeypatch, model, num_tokens)
-        assert calls_forward["execute"]["use_weight_shuffle"] is False
-        assert calls_forward["execute"]["w1_scale"] is original_w13_scale
-        assert calls_forward["execute"]["w2_scale"] is original_w2_scale
-        assert torch.all(calls_forward["execute"]["w1_scale"] == 7.0)
-        assert torch.all(calls_forward["execute"]["w2_scale"] == 11.0)
+        calls_forward = _forward_reloaded_weights(monkeypatch, model, num_tokens)
+        assert not calls_forward["execute"].get("use_weight_shuffle", False)
+        if gemm2:
+            assert calls_forward["execute"]["w1_scale"] is original_w13_scale
+            assert calls_forward["execute"]["w2_scale"] is original_w2_scale
+        assert torch.all(calls_forward["execute"]["w1_scale"] == 7.0 * compensation)
+        assert torch.all(calls_forward["execute"]["w2_scale"] == 11.0 * compensation)
 
     # A later checkpoint reload must convert its fresh bytes exactly once and
     # restore the same runtime owners after a kernel-format update.
     reload_weights(iter(checkpoint), is_checkpoint_format=True)
-    assert calls["repack"] == 4
-    assert glm_expert_weights_use_gemm2_layout(model)
+    assert calls["repack"] == (4 if gemm2 else 0)
+    assert glm_expert_weights_use_gemm2_layout(model) is gemm2
     assert model.w13_weight is original_w13
     assert model.w2_weight is original_w2
     assert method.moe_quant_config.w1_scale is original_w13_scale
     assert method.moe_quant_config.w2_scale is original_w2_scale
-    calls_forward = _forward_reloaded_gemm2(monkeypatch, model)
-    assert calls_forward["execute"]["use_weight_shuffle"] is False
-    assert torch.all(calls_forward["execute"]["w1_scale"] == 2.0)
-    assert torch.all(calls_forward["execute"]["w2_scale"] == 3.0)
+    calls_forward = _forward_reloaded_weights(monkeypatch, model)
+    assert not calls_forward["execute"].get("use_weight_shuffle", False)
+    assert torch.all(calls_forward["execute"]["w1_scale"] == 2.0 * compensation)
+    assert torch.all(calls_forward["execute"]["w2_scale"] == 3.0 * compensation)
 
 
 def test_v2_reload_failure_does_not_commit_gemm2_generation(monkeypatch) -> None:
@@ -1109,7 +1162,7 @@ def test_v2_reload_preserves_non_glm_parameter_owners() -> None:
     assert not hasattr(model, "_glm_w4a8_gemm2_generation")
 
 
-def _forward_reloaded_gemm2(monkeypatch, layer, num_tokens=3):
+def _forward_reloaded_weights(monkeypatch, layer, num_tokens=3):
     from vllm_hcu.model_executor.layers.quantization import (
         compressed_tensors_moe_runtime,
     )
@@ -1129,7 +1182,20 @@ def _forward_reloaded_gemm2(monkeypatch, layer, num_tokens=3):
 
     def aiter_moe(**kwargs: object):
         calls["execute"] = kwargs
-        return torch.zeros((num_tokens, 4), dtype=kwargs["output_dtype"])
+        return torch.zeros_like(kwargs["hidden_states"], dtype=kwargs["output_dtype"])
+
+    def native_moe(x, *args, **kwargs):
+        calls["execute"] = kwargs
+        return torch.zeros_like(x)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.model_executor.layers.fused_moe.fused_moe",
+        _module(
+            "vllm.model_executor.layers.fused_moe.fused_moe",
+            fused_experts_impl=native_moe,
+        ),
+    )
 
     monkeypatch.setitem(
         sys.modules,
@@ -1144,7 +1210,7 @@ def _forward_reloaded_gemm2(monkeypatch, layer, num_tokens=3):
     compressed_tensors_moe_runtime.apply_aiter_w4a8_moe(
         layer.quant_method,
         layer,
-        torch.ones((num_tokens, 4), dtype=torch.bfloat16),
+        torch.ones((num_tokens, layer.w2_weight.shape[1]), dtype=torch.bfloat16),
         torch.ones((num_tokens, 2), dtype=torch.float32),
         torch.zeros((num_tokens, 2), dtype=torch.int32),
     )

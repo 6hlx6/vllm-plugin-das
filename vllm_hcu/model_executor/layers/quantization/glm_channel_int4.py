@@ -111,14 +111,14 @@ _LAYER_EXPERT_PREFIX = re.compile(
 )
 
 
-def _quant_field(value: Any, name: str) -> Any:
+def _quant_field(value: Any, name: str, default: Any = None) -> Any:
     """Read one quantization field from a raw dict or QuantizationArgs."""
     if value is None:
         return None
     if isinstance(value, dict):
-        field = value.get(name)
+        field = value.get(name, default)
     else:
-        field = getattr(value, name, None)
+        field = getattr(value, name, default)
     return getattr(field, "value", field)
 
 
@@ -127,11 +127,12 @@ def _is_channel_int4_w4a8_scheme(
     activations: Any,
     group_format: Any,
 ) -> bool:
+    # Match QuantizationArgs' default without accepting explicit false/null.
     return (
         _quant_field(weights, "num_bits") == 4
         and _quant_field(weights, "strategy") == "channel"
         and _quant_field(weights, "type") == "int"
-        and _quant_field(weights, "symmetric") is True
+        and _quant_field(weights, "symmetric", True) is True
         and _quant_field(activations, "num_bits") == 8
         and _quant_field(activations, "strategy") == "token"
         and _quant_field(activations, "dynamic") is True
