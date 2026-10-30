@@ -1695,14 +1695,11 @@ class DeepseekV2Model(nn.Module):
             for name in params_dict
             if ".indexer." in name
         }
-        experts_use_unpacked_weight = not any(
-            param_name.endswith("w13_weight_packed") for param_name in params_dict
-        )
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
             normalized_name = normalize_routed_expert_checkpoint_name(
-                name, experts_use_unpacked_weight
+                name, params_dict=params_dict
             )
             if normalized_name is None:
                 continue

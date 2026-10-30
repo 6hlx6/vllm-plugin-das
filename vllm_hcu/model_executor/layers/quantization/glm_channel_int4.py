@@ -14,7 +14,7 @@ names.
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any
 
 import torch
@@ -96,10 +96,13 @@ def is_glm_moe_dsa_model(hf_config: Any) -> bool:
     return "GlmMoeDsaForCausalLM" in architectures
 
 
-# GLM MoE keeps the first layers dense. Probes must include a later expert
-# layer, because an INT4 regex or ignore entry often skips layer 0.
-_EXPERT_PROBE_LAYER_INDEXES = range(8)
+# Shared experts and attention projections are not probes. Layer indexes come
+# from the model depth and from literal indexes written in the targets.
 _MTP_BLOCK_MARKER = ".mtp_block."
+_LAYER_INDEX_IN_TARGET = re.compile(r"layers\\*\.(\d+)")
+# Class-name targets such as Linear stay on the parent method. RoutedExperts
+# is the fused expert module and is matched the same way as the facade.
+_GENERIC_CLASS_TARGETS = frozenset({"Linear", "Module", "object"})
 # Backbone and MTP experts share this shape. The index is what a published
 # regex often fails to extend past ``num_hidden_layers``.
 _LAYER_EXPERT_PREFIX = re.compile(
@@ -156,10 +159,40 @@ def _group_targets(group: dict[str, Any]) -> list[str]:
     return [target for target in targets if isinstance(target, str)]
 
 
-def _routed_expert_probes() -> list[tuple[str, str]]:
-    """Return ``(module_prefix, match_name)`` for early routed-expert layers."""
+def _layer_indexes_from_targets(targets: list[str]) -> set[int]:
+    indexes: set[int] = set()
+    for target in targets:
+        for match in _LAYER_INDEX_IN_TARGET.finditer(target):
+            indexes.add(int(match.group(1)))
+    return indexes
+
+
+def _probe_layer_indexes(targets: list[str], hf_config: Any) -> list[int]:
+    """Layer indexes an INT4 expert target might name.
+
+    Uses the model depth, including MTP layers, plus any literal layer index
+    written in a target. An unanchored pattern with neither source is checked
+    against layer 0.
+    """
+    indexes = _layer_indexes_from_targets(targets)
+    if hf_config is not None:
+        count = getattr(hf_config, "num_hidden_layers", None)
+        nextn = getattr(hf_config, "num_nextn_predict_layers", 0) or 0
+        if isinstance(count, int) and not isinstance(count, bool) and count > 0:
+            if not isinstance(nextn, int) or isinstance(nextn, bool) or nextn < 0:
+                nextn = 0
+            indexes.update(range(count + nextn))
+    if not indexes:
+        indexes.add(0)
+    return sorted(indexes)
+
+
+def _routed_expert_probes(
+    targets: list[str], hf_config: Any = None
+) -> list[tuple[str, str]]:
+    """Return ``(module_prefix, match_name)`` for candidate expert layers."""
     probes = []
-    for index in _EXPERT_PROBE_LAYER_INDEXES:
+    for index in _probe_layer_indexes(targets, hf_config):
         prefix = f"model.layers.{index}.mlp.experts"
         probes.append((prefix, prefix))
         for proj_name in ("gate_proj", "up_proj", "down_proj"):
@@ -167,18 +200,22 @@ def _routed_expert_probes() -> list[tuple[str, str]]:
     return probes
 
 
-def _targets_cover_routed_experts(targets: list[str], ignore: Any = None) -> bool:
+def _targets_cover_routed_experts(
+    targets: list[str],
+    ignore: Any = None,
+    hf_config: Any = None,
+) -> bool:
     """Return whether an INT4 target selects a routed expert that is not ignored.
 
-    Layer 0 can be dense or ignored while later expert layers stay INT4. One
-    such layer is enough to select this method. Shared experts and attention
-    projections do not match these probes.
+    Early dense layers may be ignored or absent from the INT4 regex. One later
+    expert layer is enough. Shared experts and attention projections do not
+    match these probes.
     """
     from vllm.model_executor.layers.quantization.utils.config_utils import (
         is_equal_or_regex_match,
     )
 
-    for module_prefix, probe in _routed_expert_probes():
+    for module_prefix, probe in _routed_expert_probes(targets, hf_config):
         if _ignore_covers_prefix(module_prefix, ignore):
             continue
         for target in targets:
@@ -201,7 +238,10 @@ def _ignore_covers_prefix(prefix: str, ignore: Any, fused_mapping: Any = None) -
     )
 
 
-def is_glm_channel_int4_w4a8(hf_quant_cfg: dict[str, Any] | None) -> bool:
+def is_glm_channel_int4_w4a8(
+    hf_quant_cfg: dict[str, Any] | None,
+    hf_config: Any = None,
+) -> bool:
     """Return whether the quant config mixes channel INT4 experts and channel INT8 linears.
 
     The INT4 group must target a routed-expert layer that ``ignore`` does not
@@ -230,16 +270,28 @@ def is_glm_channel_int4_w4a8(hf_quant_cfg: dict[str, Any] | None) -> bool:
             has_int8 = True
     if not has_int8 or not int4_targets:
         return False
-    return _targets_cover_routed_experts(int4_targets, ignore)
+    return _targets_cover_routed_experts(int4_targets, ignore, hf_config)
 
 
-def _scheme_is_channel_int4(scheme: Any) -> bool:
+def _effective_scheme_format(scheme: Any, config: Any) -> Any:
+    """Return the group format, or the config-wide format when the group omits it.
+
+    The native parser stores a missing group format as None and fills
+    ``config.quant_format`` only inside ``get_scheme_dict``.
+    """
+    group_format = scheme.get("format") if isinstance(scheme, dict) else None
+    if group_format is not None:
+        return group_format
+    return getattr(config, "quant_format", None)
+
+
+def _scheme_is_channel_int4(scheme: Any, config: Any = None) -> bool:
     if not isinstance(scheme, dict):
         return False
     return _is_channel_int4_w4a8_scheme(
         scheme.get("weights"),
         scheme.get("input_activations"),
-        scheme.get("format"),
+        _effective_scheme_format(scheme, config),
     )
 
 
@@ -278,6 +330,28 @@ def _match_target_by_name(
     return matched[0] if matched else None
 
 
+def _match_target_by_class(layer: Any, targets: Any) -> str | None:
+    """Match ``RoutedExperts`` and other non-generic class targets."""
+    if layer is None:
+        return None
+    target_list = [
+        target
+        for target in targets
+        if isinstance(target, str) and not target.startswith("re:")
+    ]
+    for cls in type(layer).__mro__:
+        name = cls.__name__
+        if name in _GENERIC_CLASS_TARGETS:
+            continue
+        if name in target_list:
+            return name
+    return None
+
+
+def _projection_names(layer: Any, prefix: str) -> tuple[str, str, str]:
+    return tuple(f"{prefix}.0.{proj_name}" for proj_name in _expert_proj_names(layer))
+
+
 def _expert_proj_names(layer: Any) -> tuple[str, str, str]:
     return (
         getattr(layer, "ckpt_gate_proj_name", "gate_proj"),
@@ -291,27 +365,25 @@ def _explicit_expert_scheme(
 ) -> tuple[bool, Any]:
     """Return ``(matched, scheme)`` for a routed-expert prefix.
 
-    ``matched`` is false when no target names this prefix or all three
-    projections. Projections may use different target strings; they select
-    INT4 only when every projection's scheme is channel INT4. Module-class
-    fallback is not used.
+    ``matched`` is false when no target names this prefix, its class, or all
+    three projections. Projections may use different target strings; they
+    select INT4 only when every projection's scheme is channel INT4. A generic
+    ``Linear`` class target is not an expert scheme.
     """
     scheme_map = getattr(config, "target_scheme_map", None) or {}
     fused_mapping = getattr(config, "packed_modules_mapping", None) or {}
     matched = _match_target_by_name(prefix, scheme_map, fused_mapping)
+    if matched is None:
+        matched = _match_target_by_class(layer, scheme_map)
     if matched is not None:
         return True, scheme_map.get(matched)
     proj_schemes = []
-    for proj_name in _expert_proj_names(layer):
-        proj_target = _match_target_by_name(
-            f"{prefix}.0.{proj_name}",
-            scheme_map,
-            fused_mapping,
-        )
+    for proj_name in _projection_names(layer, prefix):
+        proj_target = _match_target_by_name(proj_name, scheme_map, fused_mapping)
         if proj_target is None:
             return False, None
         proj_schemes.append(scheme_map.get(proj_target))
-    if all(_scheme_is_channel_int4(scheme) for scheme in proj_schemes):
+    if all(_scheme_is_channel_int4(scheme, config) for scheme in proj_schemes):
         return True, proj_schemes[0]
     return True, None
 
@@ -383,9 +455,14 @@ def routed_expert_uses_glm_channel_int4(
     fused_mapping = getattr(config, "packed_modules_mapping", None) or {}
     if _ignore_covers_prefix(prefix, ignore, fused_mapping):
         return False
+    if any(
+        _ignore_covers_prefix(proj_name, ignore, fused_mapping)
+        for proj_name in _projection_names(layer, prefix)
+    ):
+        return False
     matched, scheme = _explicit_expert_scheme(config, layer, prefix)
     if matched:
-        return _scheme_is_channel_int4(scheme)
+        return _scheme_is_channel_int4(scheme, config)
     if _MTP_BLOCK_MARKER in prefix:
         unwrapped = prefix.replace(_MTP_BLOCK_MARKER, ".")
         if unwrapped == prefix or _ignore_covers_prefix(
@@ -394,31 +471,63 @@ def routed_expert_uses_glm_channel_int4(
             return False
         matched, scheme = _explicit_expert_scheme(config, layer, unwrapped)
         if matched:
-            return _scheme_is_channel_int4(scheme)
+            return _scheme_is_channel_int4(scheme, config)
     if num_hidden_layers is None:
         num_hidden_layers = _infer_num_hidden_layers()
     for alias in _mtp_alias_prefixes(prefix, num_hidden_layers):
         if _ignore_covers_prefix(alias, ignore, fused_mapping):
             continue
         matched, scheme = _explicit_expert_scheme(config, layer, alias)
-        if matched and _scheme_is_channel_int4(scheme):
+        if matched and _scheme_is_channel_int4(scheme, config):
             return True
     return False
 
 
+def _expert_owner_prefixes(name: str) -> list[str]:
+    """Runtime expert-module prefixes that can own this checkpoint tensor."""
+    marker = ".mlp.experts."
+    if marker not in name:
+        return []
+    head = name.split(marker, 1)[0]
+    owners = [head + ".mlp.experts"]
+    if ".mtp_block" not in head:
+        owners.append(head + ".mtp_block.mlp.experts")
+    return owners
+
+
+def _owner_uses_unpacked_expert_weight(
+    name: str, params_dict: Mapping[str, Any]
+) -> bool:
+    """Return whether every located owner of this tensor stores ``w13_weight``."""
+    decisions = []
+    for owner in _expert_owner_prefixes(name):
+        if f"{owner}.w13_weight_packed" in params_dict:
+            decisions.append(False)
+        elif f"{owner}.w13_weight" in params_dict:
+            decisions.append(True)
+    return bool(decisions) and all(decisions)
+
+
 def normalize_routed_expert_checkpoint_name(
     name: str,
-    experts_use_unpacked_weight: bool,
+    experts_use_unpacked_weight: bool = False,
+    params_dict: Mapping[str, Any] | None = None,
 ) -> str | None:
     """Rewrite packed routed-expert tensor names so the existing loader can match them.
 
-    Applied only when expert parameters are named ``w13_weight`` rather than
-    ``w13_weight_packed``: ``weight_packed`` becomes ``weight``, and
-    ``weight_shape`` returns None so the caller skips it. Parameters that are
-    already packed-named (for example compressed-tensors W4A16) are returned
-    unchanged, and their ``weight_shape`` tensors are still loaded.
+    When ``params_dict`` is given, only the expert module that owns this tensor
+    is consulted. A W4A16 owner keeps ``weight_packed``. A W4A8 owner, including
+    an MTP module registered under ``.mtp_block``, rewrites ``weight_packed`` to
+    ``weight`` and drops ``weight_shape``. The boolean is the whole-model
+    fallback used when the parameter map is absent.
     """
-    if ".mlp.experts." not in name or not experts_use_unpacked_weight:
+    if ".mlp.experts." not in name:
+        return name
+    if params_dict is not None:
+        experts_use_unpacked_weight = _owner_uses_unpacked_expert_weight(
+            name, params_dict
+        )
+    if not experts_use_unpacked_weight:
         return name
     if name.endswith(".weight_shape"):
         return None

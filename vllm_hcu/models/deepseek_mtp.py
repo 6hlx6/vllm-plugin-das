@@ -349,15 +349,12 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts, SupportsPP):
         loaded_params: set[str] = set()
         # Determine whether to load the indexer weight
         mtp_has_indexer = any("indexer" in param_name for param_name in params_dict.keys())
-        experts_use_unpacked_weight = not any(
-            param_name.endswith("w13_weight_packed") for param_name in params_dict
-        )
         _pending_wk_fp8: dict = {}  # FP8 indexer wk dequant buffer
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
             normalized_name = normalize_routed_expert_checkpoint_name(
-                name, experts_use_unpacked_weight
+                name, params_dict=params_dict
             )
             if normalized_name is None:
                 continue

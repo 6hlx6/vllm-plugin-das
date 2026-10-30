@@ -63,6 +63,29 @@ def glm_expert_weights_use_gemm2_layout(layer: torch.nn.Module) -> bool:
     return recorded == _expert_weight_generation(layer)
 
 
+def commit_installed_glm_w4a8_gemm2_generation(layer: torch.nn.Module) -> None:
+    """Point the gemm2 marker at the parameters that own the converted bytes.
+
+    Checkpoint reload records the marker on the temporary materialized
+    Parameter, then copies those bytes back onto the original runtime
+    Parameter. Kernel-format reload copies into that same Parameter and
+    bumps its version. Neither path may run gemm2 repack again.
+    """
+    if not getattr(layer, _GLM_W4A8_GEMM2_GENERATION, None):
+        return
+    generation = _expert_weight_generation(layer)
+    if not generation:
+        return
+    setattr(layer, _GLM_W4A8_GEMM2_GENERATION, generation)
+    layer._glm_w4a8_gemm2_shuffled = True
+
+
+def commit_installed_glm_w4a8_gemm2_generations(model: torch.nn.Module) -> None:
+    """Refresh gemm2 markers after reload has restored runtime parameters."""
+    for module in model.modules():
+        commit_installed_glm_w4a8_gemm2_generation(module)
+
+
 def _disable_generic_w4a8_shuffle(config: object) -> None:
     """gemm2 is already the final layout, so skip the generic weight/scale shuffle."""
     if getattr(config, "need_shuffle", False):
@@ -199,7 +222,7 @@ class GlmMoeDsaChannelW4A8Config(CompressedTensorsConfig):
             return None
         if not is_glm_moe_dsa_model(hf_config):
             return None
-        if not is_glm_channel_int4_w4a8(hf_quant_cfg):
+        if not is_glm_channel_int4_w4a8(hf_quant_cfg, hf_config):
             return None
         return cls.get_name()
 

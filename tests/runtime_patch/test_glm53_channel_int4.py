@@ -87,7 +87,9 @@ def _quant_config() -> dict:
 
 def _glm_hf_config() -> SimpleNamespace:
     return SimpleNamespace(
-        model_type="glm_moe_dsa", architectures=["GlmMoeDsaForCausalLM"]
+        model_type="glm_moe_dsa",
+        architectures=["GlmMoeDsaForCausalLM"],
+        num_hidden_layers=61,
     )
 
 
@@ -150,14 +152,36 @@ def test_expert_int4_after_ignored_dense_layers_selects_w4a8() -> None:
         "re:^model\\.layers\\.([3-9]|[1-9]\\d+)\\.mlp\\.experts.*"
     ]
     quant["ignore"] = ["re:^model\\.layers\\.[0-2]\\..*", "lm_head"]
-    assert is_glm_channel_int4_w4a8(quant) is True
+    assert is_glm_channel_int4_w4a8(quant, config) is True
     assert (
         GlmMoeDsaW4A8Facade.override_quantization_method(quant, None, config)
         == "glm_moe_dsa_w4a8"
     )
 
 
-def test_non_expert_int4_and_ignored_experts_do_not_select_w4a8() -> None:
+def test_anchored_expert_targets_past_the_dense_prefix_select_w4a8() -> None:
+    config = _glm_hf_config()
+    for index in (8, 60):
+        quant = _quant_config()
+        quant["config_groups"]["group_int4"]["targets"] = [
+            f"re:^model\\.layers\\.{index}\\.mlp\\.experts.*"
+        ]
+        assert is_glm_channel_int4_w4a8(quant, config) is True
+        assert (
+            GlmMoeDsaW4A8Facade.override_quantization_method(quant, None, config)
+            == "glm_moe_dsa_w4a8"
+        )
+
+
+def test_omitted_group_format_still_selects_channel_int4() -> None:
+    config = _glm_hf_config()
+    quant = _quant_config()
+    del quant["config_groups"]["group_int4"]["format"]
+    assert is_glm_channel_int4_w4a8(quant, config) is True
+    assert (
+        GlmMoeDsaW4A8Facade.override_quantization_method(quant, None, config)
+        == "glm_moe_dsa_w4a8"
+    )
     config = _glm_hf_config()
     quant = _quant_config()
     quant["config_groups"]["group_int4"]["targets"] = ["re:.*self_attn.*"]
@@ -312,6 +336,43 @@ def test_routed_expert_selection_respects_targets_ignore_and_mtp() -> None:
         )
         is False
     )
+    class RoutedExperts:
+        pass
+
+    class_layer = RoutedExperts()
+    class_targets = _selection_config(
+        target_scheme_map={"RoutedExperts": _int4_scheme()}
+    )
+    assert routed_expert_uses_glm_channel_int4(
+        class_targets, class_layer, "model.layers.8.mlp.experts"
+    )
+    linear_only = _selection_config(
+        target_scheme_map={"Linear": _int4_scheme()}
+    )
+    assert (
+        routed_expert_uses_glm_channel_int4(
+            linear_only, class_layer, "model.layers.8.mlp.experts"
+        )
+        is False
+    )
+    omitted_format = _int4_scheme()
+    omitted_format.pop("format")
+    format_config = _selection_config(
+        quant_format="pack-quantized",
+        target_scheme_map={"re:.*\\.mlp\\.experts.*": omitted_format},
+    )
+    assert routed_expert_uses_glm_channel_int4(
+        format_config, layer, "model.layers.0.mlp.experts"
+    )
+    projection_ignore = _selection_config(
+        ignore=["re:.*experts\\.\\d+\\.(gate_proj|up_proj|down_proj)$"]
+    )
+    assert (
+        routed_expert_uses_glm_channel_int4(
+            projection_ignore, layer, "model.layers.0.mlp.experts"
+        )
+        is False
+    )
 
 
 def test_get_quant_method_follows_prefix_scheme(monkeypatch) -> None:
@@ -365,6 +426,15 @@ def test_get_quant_method_follows_prefix_scheme(monkeypatch) -> None:
     }
     assert config.get_quant_method(layer, "model.layers.61.mlp.experts") == "int4"
     assert config.get_quant_method(layer, "model.layers.3.mlp.experts") == "parent"
+    config.ignore = ["re:.*experts\\.\\d+\\.(gate_proj|up_proj|down_proj)$"]
+    config.target_scheme_map = {"re:.*\\.mlp\\.experts.*": _int4_scheme()}
+    assert config.get_quant_method(layer, "model.layers.0.mlp.experts") == "parent"
+    config.ignore = []
+    omitted_format = _int4_scheme()
+    omitted_format.pop("format")
+    config.quant_format = "pack-quantized"
+    config.target_scheme_map = {"RoutedExperts": omitted_format}
+    assert config.get_quant_method(layer, "model.layers.60.mlp.experts") == "int4"
 
 
 def test_expert_loaders_convert_weights_and_scales() -> None:
@@ -521,6 +591,30 @@ def test_expert_checkpoint_names_drop_shape_and_rebind_packed_weights() -> None:
     assert normalize_routed_expert_checkpoint_name(
         "model.layers.0.mlp.down_proj.weight", True
     ) == "model.layers.0.mlp.down_proj.weight"
+    params = {
+        "model.layers.3.mlp.experts.w13_weight_packed": object(),
+        "model.layers.4.mlp.experts.w13_weight": object(),
+        "model.layers.61.mtp_block.mlp.experts.w13_weight": object(),
+    }
+    w4a16 = "model.layers.3.mlp.experts.0.gate_proj.weight_packed"
+    w4a8 = "model.layers.4.mlp.experts.0.gate_proj.weight_packed"
+    mtp = "model.layers.61.mlp.experts.0.down_proj.weight_packed"
+    assert normalize_routed_expert_checkpoint_name(w4a16, params_dict=params) == w4a16
+    assert normalize_routed_expert_checkpoint_name(
+        "model.layers.3.mlp.experts.0.gate_proj.weight_shape", params_dict=params
+    ) == "model.layers.3.mlp.experts.0.gate_proj.weight_shape"
+    assert normalize_routed_expert_checkpoint_name(w4a8, params_dict=params) == (
+        "model.layers.4.mlp.experts.0.gate_proj.weight"
+    )
+    assert (
+        normalize_routed_expert_checkpoint_name(
+            "model.layers.4.mlp.experts.0.up_proj.weight_shape", params_dict=params
+        )
+        is None
+    )
+    assert normalize_routed_expert_checkpoint_name(mtp, params_dict=params) == (
+        "model.layers.61.mlp.experts.0.down_proj.weight"
+    )
 
 
 def _glm_aiter_method(moe_backend: str):
@@ -614,6 +708,154 @@ def test_glm_aiter_post_load_repacks_replaced_weights(monkeypatch) -> None:
     assert calls["repack"] == 4
     assert torch.equal(layer.w13_weight, fresh + 1)
     assert layer._glm_w4a8_gemm2_shuffled is True
+
+
+def test_reload_weights_keeps_gemm2_generation_for_later_forward(monkeypatch) -> None:
+    from vllm.model_executor.model_loader.reload.layerwise import (
+        record_metadata_for_reloading,
+    )
+    from vllm_hcu.model_executor.layers.quantization import (
+        compressed_tensors_moe_runtime,
+    )
+    from vllm_hcu.model_executor.layers.quantization.glm_moe_dsa_w4a8 import (
+        glm_expert_weights_use_gemm2_layout,
+    )
+    from vllm_hcu.v1.hcu_model_runner import GPUModelRunner
+
+    config = SimpleNamespace(need_shuffle=True, need_shuffle_scale=True)
+    calls = _patch_glm_post_load(monkeypatch, config)
+    method, _layer = _glm_aiter_method("auto")
+
+    class ExpertModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.quant_method = method
+            self.w13_weight = torch.nn.Parameter(
+                torch.arange(32, dtype=torch.int8).reshape(2, 8, 2),
+                requires_grad=False,
+            )
+            self.w2_weight = torch.nn.Parameter(
+                torch.arange(16, dtype=torch.int8).reshape(2, 4, 2),
+                requires_grad=False,
+            )
+
+        def load_weights(self, weights):
+            params = dict(self.named_parameters())
+            loaded = set()
+            for name, tensor in weights:
+                param = params[name]
+                param.weight_loader(param, tensor)
+                loaded.add(name)
+            return loaded
+
+    def base_loader(param, loaded_weight, *args, **kwargs):
+        if param.is_meta:
+            counted = loaded_weight.detach().cpu().clone()
+            counted.copy_(loaded_weight.detach().cpu())
+            return
+        param.data.copy_(loaded_weight)
+
+    model = ExpertModel()
+    model.w13_weight.weight_loader = base_loader
+    model.w2_weight.weight_loader = base_loader
+    model.global_num_experts = 2
+    model.swiglu_limit = None
+    model._expert_map = None
+    model.expert_mask = None
+    compressed_tensors_moe_runtime.install_aiter_moe_weight_layout(
+        model,
+        SimpleNamespace(
+            quant_type="w4a8",
+            solution_type="moe_c",
+            need_shuffle=False,
+            need_shuffle_scale=False,
+        ),
+        logical_shape=(2, 8, 4, 4),
+    )
+    record_metadata_for_reloading(model)
+    original_w13 = model.w13_weight
+    original_w2 = model.w2_weight
+    runner = SimpleNamespace(
+        get_model=lambda: model,
+        model_config=SimpleNamespace(quantization="glm_moe_dsa_w4a8"),
+        load_config=SimpleNamespace(),
+    )
+    checkpoint = [
+        ("w13_weight", torch.ones_like(original_w13)),
+        ("w2_weight", torch.ones_like(original_w2)),
+    ]
+    GPUModelRunner.reload_weights(
+        runner, iter(checkpoint), is_checkpoint_format=True
+    )
+
+    assert model.w13_weight is original_w13
+    assert model.w2_weight is original_w2
+    assert calls["repack"] == 2
+    assert glm_expert_weights_use_gemm2_layout(model)
+    assert torch.equal(model.w13_weight, torch.ones_like(original_w13) + 1)
+    calls_forward = _forward_reloaded_gemm2(monkeypatch, model)
+    assert calls_forward["execute"]["use_weight_shuffle"] is False
+
+    kernel = [
+        ("w13_weight", model.w13_weight.detach().clone()),
+        ("w2_weight", model.w2_weight.detach().clone()),
+    ]
+    GPUModelRunner.reload_weights(runner, iter(kernel), is_checkpoint_format=False)
+    assert calls["repack"] == 2
+    assert glm_expert_weights_use_gemm2_layout(model)
+    calls_forward = _forward_reloaded_gemm2(monkeypatch, model)
+    assert calls_forward["execute"]["use_weight_shuffle"] is False
+
+
+def _forward_reloaded_gemm2(monkeypatch, layer):
+    from vllm_hcu.model_executor.layers.quantization import (
+        compressed_tensors_moe_runtime,
+    )
+
+    calls: dict[str, object] = {}
+
+    class MoeQuantType:
+        W4A8 = "w4a8"
+
+    def get_config(**kwargs: object):
+        return True, SimpleNamespace(
+            quant_type="w4a8",
+            solution_type="moe_c",
+            need_shuffle=True,
+            need_shuffle_scale=False,
+        )
+
+    def aiter_moe(**kwargs: object):
+        calls["execute"] = kwargs
+        return torch.zeros((3, 4), dtype=kwargs["output_dtype"])
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            MoeQuantType=MoeQuantType,
+            get_aiter_moe_config=get_config,
+            aiter_moe=aiter_moe,
+        ),
+    )
+    apply_method = SimpleNamespace(
+        moe=SimpleNamespace(num_experts=2),
+        moe_quant_config=SimpleNamespace(
+            w1_scale=torch.ones((2, 8, 1)),
+            w2_scale=torch.ones((2, 4, 1)),
+            a1_scale=None,
+            a2_scale=None,
+        ),
+    )
+    compressed_tensors_moe_runtime.apply_aiter_w4a8_moe(
+        apply_method,
+        layer,
+        torch.ones((3, 4), dtype=torch.bfloat16),
+        torch.ones((3, 2), dtype=torch.float32),
+        torch.zeros((3, 2), dtype=torch.int32),
+    )
+    return calls
 
 
 def test_glm_triton_post_load_keeps_slimquant_packing(monkeypatch) -> None:

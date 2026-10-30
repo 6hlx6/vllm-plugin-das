@@ -160,7 +160,7 @@ class GlmMoeDsaW4A8Facade(_SlimQuantFacade):
             return None
         if not is_glm_moe_dsa_model(hf_config):
             return None
-        if not is_glm_channel_int4_w4a8(hf_quant_cfg):
+        if not is_glm_channel_int4_w4a8(hf_quant_cfg, hf_config):
             return None
         return cls._registry_name
 
