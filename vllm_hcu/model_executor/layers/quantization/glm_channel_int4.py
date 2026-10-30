@@ -495,16 +495,40 @@ def _expert_owner_prefixes(name: str) -> list[str]:
     return owners
 
 
+def _expert_weight_modules(owner: str) -> tuple[str, str]:
+    """Parameter prefixes that can hold this owner's fused expert weights.
+
+    Current FusedMoE registers weights on ``experts.routed_experts``. Older
+    modules registered them directly on ``experts``.
+    """
+    return owner, f"{owner}.routed_experts"
+
+
+def _module_uses_unpacked_expert_weight(
+    module: str, params_dict: Mapping[str, Any]
+) -> bool | None:
+    """Return the naming style of one expert module, or None when it is absent."""
+    if (
+        f"{module}.w13_weight_packed" in params_dict
+        or f"{module}.w2_weight_packed" in params_dict
+    ):
+        return False
+    if f"{module}.w13_weight" in params_dict or f"{module}.w2_weight" in params_dict:
+        return True
+    return None
+
+
 def _owner_uses_unpacked_expert_weight(
     name: str, params_dict: Mapping[str, Any]
 ) -> bool:
-    """Return whether every located owner of this tensor stores ``w13_weight``."""
+    """Return whether every located owner stores ``w13_weight`` or ``w2_weight``."""
     decisions = []
     for owner in _expert_owner_prefixes(name):
-        if f"{owner}.w13_weight_packed" in params_dict:
-            decisions.append(False)
-        elif f"{owner}.w13_weight" in params_dict:
-            decisions.append(True)
+        for module in _expert_weight_modules(owner):
+            decision = _module_uses_unpacked_expert_weight(module, params_dict)
+            if decision is not None:
+                decisions.append(decision)
+                break
     return bool(decisions) and all(decisions)
 
 
@@ -516,10 +540,11 @@ def normalize_routed_expert_checkpoint_name(
     """Rewrite packed routed-expert tensor names so the existing loader can match them.
 
     When ``params_dict`` is given, only the expert module that owns this tensor
-    is consulted. A W4A16 owner keeps ``weight_packed``. A W4A8 owner, including
-    an MTP module registered under ``.mtp_block``, rewrites ``weight_packed`` to
-    ``weight`` and drops ``weight_shape``. The boolean is the whole-model
-    fallback used when the parameter map is absent.
+    is consulted. Weights may be registered on ``experts`` or on
+    ``experts.routed_experts``. A W4A16 owner keeps ``weight_packed``. A W4A8
+    owner, including an MTP module registered under ``.mtp_block``, rewrites
+    ``weight_packed`` to ``weight`` and drops ``weight_shape``. The boolean is
+    the whole-model fallback used when the parameter map is absent.
     """
     if ".mlp.experts." not in name:
         return name

@@ -615,6 +615,26 @@ def test_expert_checkpoint_names_drop_shape_and_rebind_packed_weights() -> None:
     assert normalize_routed_expert_checkpoint_name(mtp, params_dict=params) == (
         "model.layers.61.mlp.experts.0.down_proj.weight"
     )
+    nested = {
+        "layers.10.mlp.experts.routed_experts.w13_weight": object(),
+        "layers.10.mlp.experts.routed_experts.w2_weight": object(),
+        "layers.11.mlp.experts.routed_experts.w2_weight_packed": object(),
+    }
+    nested_w4a8 = "layers.10.mlp.experts.0.down_proj.weight_packed"
+    nested_w4a16 = "layers.11.mlp.experts.0.down_proj.weight_packed"
+    assert normalize_routed_expert_checkpoint_name(
+        nested_w4a8, params_dict=nested
+    ) == "layers.10.mlp.experts.0.down_proj.weight"
+    assert (
+        normalize_routed_expert_checkpoint_name(
+            "layers.10.mlp.experts.0.down_proj.weight_shape", params_dict=nested
+        )
+        is None
+    )
+    assert (
+        normalize_routed_expert_checkpoint_name(nested_w4a16, params_dict=nested)
+        == nested_w4a16
+    )
 
 
 def _glm_aiter_method(moe_backend: str):
