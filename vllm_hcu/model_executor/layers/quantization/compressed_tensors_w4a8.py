@@ -155,6 +155,21 @@ def select_method(config, layer, prefix):
     return HcuCompressedW4A8(config, layer.moe_config)
 
 
+def _shared_expert_fusion_requested(moe):
+    """Whether shared experts would be fused into this layer's expert tensors.
+
+    The model loaders decide this from the AITER flag, so ask it as well: the
+    MoE config field mirrors the flag only where this vLLM defines it, and a
+    guard that silently reads False would let the loaders rename the shared
+    experts into expert slots these parameters do not have.
+    """
+    if getattr(moe, "aiter_fmoe_shared_expert_enabled", False):
+        return True
+    from vllm._aiter_ops import rocm_aiter_ops
+
+    return bool(rocm_aiter_ops.is_fusion_moe_shared_experts_enabled())
+
+
 class HcuCompressedW4A8(SlimQuantW4A8Int8AiterMoEMethod):
     """Native config selection with packed Triton or AITER gemm2 execution."""
 
@@ -170,7 +185,7 @@ class HcuCompressedW4A8(SlimQuantW4A8Int8AiterMoEMethod):
         parallel = moe.moe_parallel_config
         if parallel.ep_size != 1:
             raise ValueError("compressed-tensors channel W4A8 currently requires EP=1")
-        if getattr(moe, "aiter_fmoe_shared_expert_enabled", False):
+        if _shared_expert_fusion_requested(moe):
             raise ValueError(
                 "compressed-tensors channel W4A8 requires shared-expert fusion disabled"
             )

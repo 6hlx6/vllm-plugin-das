@@ -288,6 +288,58 @@ def test_unsupported_execution_fails_at_construction(backend, ep):
         adapter.HcuCompressedW4A8(None, moe)
 
 
+def _fusion_moe(**fields):
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+
+    return SimpleNamespace(
+        moe_backend="auto",
+        moe_parallel_config=SimpleNamespace(ep_size=1),
+        has_bias=False,
+        activation=MoEActivation.SILU,
+        num_experts=2,
+        **fields,
+    )
+
+
+def _aiter_flag(monkeypatch, enabled):
+    import sys
+
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm._aiter_ops",
+        SimpleNamespace(
+            rocm_aiter_ops=SimpleNamespace(
+                is_fusion_moe_shared_experts_enabled=lambda: enabled
+            )
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "flag,field",
+    [
+        (True, None),  # this vLLM defines no such MoE config field
+        (True, False),  # the field exists but does not reflect the flag
+        (False, True),  # only the config field says so
+        (True, True),
+    ],
+)
+def test_shared_expert_fusion_is_rejected_from_either_signal(monkeypatch, flag, field):
+    """The loaders follow the AITER flag; the guard must not rely on a config field."""
+    _aiter_flag(monkeypatch, flag)
+    fields = {} if field is None else {"aiter_fmoe_shared_expert_enabled": field}
+    with pytest.raises(ValueError, match="shared-expert fusion"):
+        adapter.HcuCompressedW4A8(None, _fusion_moe(**fields))
+
+
+@pytest.mark.parametrize("field", [None, False])
+def test_construction_proceeds_when_no_signal_requests_fusion(monkeypatch, field):
+    _aiter_flag(monkeypatch, False)
+    fields = {} if field is None else {"aiter_fmoe_shared_expert_enabled": field}
+    method = adapter.HcuCompressedW4A8(None, _fusion_moe(**fields))
+    assert isinstance(method, adapter.HcuCompressedW4A8)
+
+
 @pytest.mark.parametrize("tp_size", [1, 2, 4, 8])
 def test_native_expert_loader_tp_shards(tp_size):
     from vllm.model_executor.layers.fused_moe import RoutedExperts
@@ -415,7 +467,7 @@ def test_mtp_quant_alias_keeps_physical_rules_and_ignore(target):
     assert adapter.mtp_quant_config(None, "model.layers.78") is None
 
 
-def test_actual_mtp_and_decoder_constructors_keep_numeric_runtime_prefix():
+def _constructor_env(copy_function=None):
     # Execute both production __init__ bodies. The installed v0.25 wheel cannot
     # import this v0.28 model (V32SparseAttnIndexer is missing), so stub only
     # the expensive attention/MoE/normalization leaves, not constructor logic.
@@ -432,7 +484,7 @@ def test_actual_mtp_and_decoder_constructors_keep_numeric_runtime_prefix():
     env = {
         "nn": torch.nn,
         "torch": torch,
-        "copy": __import__("copy").copy,
+        "copy": copy_function or __import__("copy").copy,
         "RMSNorm": Leaf,
         "SharedHead": Leaf,
         "DeepseekV2MLAAttention": Leaf,
@@ -458,7 +510,11 @@ def test_actual_mtp_and_decoder_constructors_keep_numeric_runtime_prefix():
         ]
         code = "from __future__ import annotations\n" + ast.unparse(cls)
         exec(compile(code, file, "exec"), env)  # noqa: S102 - trusted repo constructors
-    hf = SimpleNamespace(
+    return env
+
+
+def _glm_mtp_hf_config():
+    return SimpleNamespace(
         model_type="glm_moe_dsa",
         hidden_size=8,
         rms_norm_eps=1e-6,
@@ -466,21 +522,56 @@ def test_actual_mtp_and_decoder_constructors_keep_numeric_runtime_prefix():
         first_k_dense_replace=3,
         num_attention_heads=1,
     )
-    quant = CompressedTensorsConfig.from_config(recipe())
-    config = SimpleNamespace(
+
+
+def _mtp_vllm_config(quant):
+    return SimpleNamespace(
         speculative_config=SimpleNamespace(
-            draft_model_config=SimpleNamespace(hf_config=hf)
+            draft_model_config=SimpleNamespace(hf_config=_glm_mtp_hf_config())
         ),
         quant_config=quant,
         model_config=SimpleNamespace(use_mla=False),
         cache_config=None,
         parallel_config=None,
     )
+
+
+def test_actual_mtp_and_decoder_constructors_keep_numeric_runtime_prefix():
+    env = _constructor_env()
+    quant = CompressedTensorsConfig.from_config(recipe())
+    config = _mtp_vllm_config(quant)
     layer = env["DeepSeekMultiTokenPredictorLayer"](config, "model.layers.78")
     assert layer.mtp_block.layer_idx == 78
     assert layer.mtp_block.self_attn.prefix == "model.layers.78.self_attn"
     assert layer.mtp_block.mlp.prefix == "model.layers.78.mlp"
     assert layer.mtp_block.mlp.quant_config is not quant
+    assert config.quant_config is quant
+
+
+def test_mtp_only_copies_the_engine_config_when_the_quant_config_is_rewritten():
+    """Other GLM quantizations must keep the engine's VllmConfig object."""
+    import copy as copy_module
+
+    copies = []
+
+    def recording_copy(value):
+        copies.append(value)
+        return copy_module.copy(value)
+
+    env = _constructor_env(recording_copy)
+    # Not a compressed-tensors config: mtp_quant_config returns it untouched.
+    other = SimpleNamespace(name="fp8")
+    config = _mtp_vllm_config(other)
+    layer = env["DeepSeekMultiTokenPredictorLayer"](config, "model.layers.78")
+    assert copies == []
+    assert layer.mtp_block.mlp.quant_config is other
+    assert config.quant_config is other
+
+    # A compressed-tensors config is aliased, so exactly that config is copied.
+    quant = CompressedTensorsConfig.from_config(recipe())
+    config = _mtp_vllm_config(quant)
+    env["DeepSeekMultiTokenPredictorLayer"](config, "model.layers.78")
+    assert copies == [config]
     assert config.quant_config is quant
 
 

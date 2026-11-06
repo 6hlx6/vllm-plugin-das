@@ -85,9 +85,12 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
                 mtp_quant_config,
             )
 
-            vllm_config = copy(vllm_config)
-            quant_config = mtp_quant_config(quant_config, prefix)
-            vllm_config.quant_config = quant_config
+            aliased = mtp_quant_config(quant_config, prefix)
+            if aliased is not quant_config:
+                # Only a rewritten config needs its own VllmConfig; every other
+                # quantization keeps the engine's object untouched.
+                vllm_config = copy(vllm_config)
+                vllm_config.quant_config = quant_config = aliased
 
         self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
