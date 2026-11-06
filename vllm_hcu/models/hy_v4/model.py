@@ -77,6 +77,8 @@ from vllm.model_executor.models.utils import (
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
+from vllm_hcu.patch.config import get_hcu_config
+
 from .attention import (
     HYV4MLAAttention,
     compute_skip_topk_layers,
@@ -521,6 +523,93 @@ class HYV4DecoderLayer(nn.Module):
         return hidden_states, None
 
 
+def _hcu_hyv4_resolve_topk_buffer(model):
+    """Return the live top-k buffer on this module or its inner model."""
+    buffer = getattr(model, "topk_indices_buffer", None)
+    if buffer is not None:
+        return buffer
+    inner = getattr(model, "model", None)
+    return getattr(inner, "topk_indices_buffer", None) if inner is not None else None
+
+
+def _hcu_hyv4_intermediate_dict(intermediate_tensors):
+    """Return the writable intermediate-tensor mapping."""
+    if intermediate_tensors is None:
+        return None
+    tensors = getattr(intermediate_tensors, "tensors", None)
+    if isinstance(tensors, dict):
+        return tensors
+    data = getattr(intermediate_tensors, "data", None)
+    if isinstance(data, dict):
+        return data
+    if isinstance(intermediate_tensors, dict):
+        return intermediate_tensors
+    return None
+
+
+def _hcu_hyv4_sync_topk_from_pp(model, intermediate_tensors) -> None:
+    """Copy incoming PP top-k into the local live buffer."""
+    tensors = _hcu_hyv4_intermediate_dict(intermediate_tensors)
+    if tensors is None:
+        return
+    incoming = tensors.get("topk_indices_buffer")
+    buffer = _hcu_hyv4_resolve_topk_buffer(model)
+    if incoming is None or buffer is None:
+        return
+    num_tokens = min(incoming.shape[0], buffer.shape[0])
+    buffer[:num_tokens].copy_(incoming[:num_tokens], non_blocking=True)
+
+
+def _hcu_hyv4_require_pp_topk_layout(vllm_config: VllmConfig) -> None:
+    """Reject configs where PP top-k rows cannot match ``hidden_states`` rows.
+
+    PP hands each stage the full-token layout, so the top-k rows pair one to one
+    with ``hidden_states``. Lightly-CP shards tokens across TP inside a stage and
+    needs a split on receive plus a gather on send; HY V4 implements neither.
+    """
+    if get_pp_group().world_size <= 1:
+        return
+    if get_hcu_config(vllm_config).enable_lightly_cp:
+        raise ValueError(
+            "HY V4 pipeline parallelism does not support lightly-CP: sparse "
+            "top-k indices cross PP stages in full-token layout only."
+        )
+
+
+def _hcu_hyv4_append_topk_to_pp(model, intermediate_tensors) -> None:
+    """Attach the live top-k buffer to outgoing PP tensors."""
+    tensors = _hcu_hyv4_intermediate_dict(intermediate_tensors)
+    buffer = _hcu_hyv4_resolve_topk_buffer(model)
+    if tensors is None or buffer is None:
+        return
+    hidden = tensors.get("hidden_states")
+    num_tokens = hidden.shape[0] if hidden is not None else buffer.shape[0]
+    # Clone: the live buffer is rewritten by the next step while the send is in flight.
+    tensors["topk_indices_buffer"] = buffer[:num_tokens].clone()
+
+
+def _hcu_hyv4_wrap_make_empty(orig_empty):
+    """Reserve a top-k slot in empty PP intermediate tensors."""
+    if getattr(orig_empty, "_hcu_hyv4_pp_topk_wrapped", False):
+        return orig_empty
+
+    def _wrapped(batch_size, dtype, device, *args, **kwargs):
+        result = orig_empty(batch_size, dtype, device, *args, **kwargs)
+        model = getattr(_wrapped, "_hcu_hyv4_owner", None)
+        buffer = _hcu_hyv4_resolve_topk_buffer(model) if model is not None else None
+        tensors = _hcu_hyv4_intermediate_dict(result)
+        if buffer is not None and tensors is not None and "topk_indices_buffer" not in tensors:
+            tensors["topk_indices_buffer"] = torch.zeros(
+                (int(batch_size), int(buffer.shape[-1])),
+                dtype=torch.int32,
+                device=device,
+            )
+        return result
+
+    _wrapped._hcu_hyv4_pp_topk_wrapped = True
+    return _wrapped
+
+
 class HYV4Model(nn.Module, MixtureOfExperts):
     """HY V4 backbone."""
 
@@ -543,6 +632,7 @@ class HYV4Model(nn.Module, MixtureOfExperts):
         self.vocab_size = config.vocab_size
         self.is_sparse = hasattr(config, "index_topk")
         if self.is_sparse:
+            _hcu_hyv4_require_pp_topk_layout(vllm_config)
             self.topk_indices_buffer = torch.empty(
                 vllm_config.scheduler_config.max_num_batched_tokens,
                 config.index_topk,
@@ -609,6 +699,9 @@ class HYV4Model(nn.Module, MixtureOfExperts):
                     ["hidden_states", "residual"], config.hidden_size
                 )
             )
+        wrapped_empty = _hcu_hyv4_wrap_make_empty(self.make_empty_intermediate_tensors)
+        wrapped_empty._hcu_hyv4_owner = self
+        self.make_empty_intermediate_tensors = wrapped_empty
 
         # MoE hyperparameters (consumed by EPLB).
         self.expert_weights: MutableSequence[Sequence[torch.Tensor]] = []
@@ -712,6 +805,8 @@ class HYV4Model(nn.Module, MixtureOfExperts):
             residual = None
         else:
             assert intermediate_tensors is not None
+            # Restore sparse top-k sent by the previous PP stage.
+            _hcu_hyv4_sync_topk_from_pp(self, intermediate_tensors)
             hidden_states = intermediate_tensors["hidden_states"]
             # In iHC mode the flattened [num_tokens, hc*h] tensor from the
             # previous PP stage is reshaped back to 3D by the first layer's
@@ -725,10 +820,13 @@ class HYV4Model(nn.Module, MixtureOfExperts):
             if self.enable_ihc:
                 # hidden_states is [num_tokens, hc, h]; flatten the channel dim
                 # for PP transfer (matches the 2D receive buffer).
-                return IntermediateTensors({"hidden_states": hidden_states.flatten(1)})
-            return IntermediateTensors(
-                {"hidden_states": hidden_states, "residual": residual}
-            )
+                output = IntermediateTensors({"hidden_states": hidden_states.flatten(1)})
+            else:
+                output = IntermediateTensors(
+                    {"hidden_states": hidden_states, "residual": residual}
+                )
+            _hcu_hyv4_append_topk_to_pp(self, output)
+            return output
         if self.enable_ihc:
             hidden_states = self.hc_head(hidden_states)
         else:

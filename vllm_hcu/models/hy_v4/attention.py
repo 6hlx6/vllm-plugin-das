@@ -236,8 +236,9 @@ def require_local_indexer_producer(
         )
     skip_topk_layers = compute_skip_topk_layers(config)
     layer_types = getattr(config, "layer_types", None)
+    # A previous PP stage supplies top-k, so a later stage may start on a shared indexer.
     if layer_types is not None:
-        has_local_producer = False
+        has_local_producer = start_layer > 0
         for layer_idx in range(start_layer, end_layer):
             # Match HYV4MLAAttention construction: a declared "full"
             # indexer on a dense attention layer does not create an indexer.
@@ -256,9 +257,8 @@ def require_local_indexer_producer(
                 )
         return
 
-    # Retain the conservative declared-pattern check for callers that do not
-    # supply attention layer types.
-    if start_layer in skip_topk_layers:
+    # Without layer types, still reject a first stage that starts on a shared indexer.
+    if start_layer in skip_topk_layers and start_layer == 0:
         raise ValueError(
             "HY V4 pipeline stage starts at shared indexer layer "
             f"{start_layer}, but top-k indices are not transferred between "
