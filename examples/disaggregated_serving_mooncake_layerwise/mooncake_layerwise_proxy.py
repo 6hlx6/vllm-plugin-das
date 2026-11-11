@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Layerwise Mooncake 代理：Prefill 分配 KV 后立刻拉起 Decode。
+"""Layerwise Mooncake 代理：Prefill 一开始计算就拉起 Decode。
 
-原来的代理要等 Prefill 的 HTTP 响应才把请求转给 Decode，握手发生在计算结束之后，
-按层发送会挤在最后几十毫秒。本代理在 Prefill 请求里带上通知地址，worker 一分配
-到 block 就回调 /notify，Decode 在后续层还在计算时完成握手。整包部署不要用它。
+Decode 需要的 remote_engine_id / bootstrap 地址在启动时从 Prefill 的 /query 预取，
+因此 Prefill 请求发出后可以立刻把 Decode 请求转发出去，两者真正并行——和标准
+mooncake_connector_proxy 一致。Prefill 请求仍带上 layerwise_notify_url，worker 分配
+到 block 后会回调控件，作为预取失效（Prefill 重启换了 engine id）时的退路。
+整包部署不要用它。
 """
 
 from __future__ import annotations
@@ -28,12 +30,63 @@ _NOTIFY_HOST = ""
 _BOOTSTRAP_PORT = 8998
 _DECODE_URL = ""
 _NOTIFY_TIMEOUT_S = 120.0
+_ENGINE_IDS: dict[int, str] = {}
 
 
 def _bootstrap_addr(payload: dict) -> str:
     port = int(payload.get("remote_bootstrap_port") or _BOOTSTRAP_PORT)
     host = _PREFILL_HOST or "127.0.0.1"
     return f"http://{host}:{port}"
+
+
+def _discover_prefiller(timeout_s: float = 60.0) -> None:
+    """预取 Prefill 的 engine id，让 Decode 可以不等 Prefill 响应就转发。
+
+    对齐 mooncake_connector_proxy 的 /query 探测：拿到后 job 级参数（engine id、
+    bootstrap 地址）在请求到来前就是已知的，Prefill 与 Decode 才能真正并行。
+    """
+    url = _bootstrap_addr({})
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            response = httpx.get(url + "/query", timeout=5.0)
+            response.raise_for_status()
+            data = response.json()
+        except Exception:
+            time.sleep(1.0)
+            continue
+        engine_ids = {
+            int(rank): str(entry.get("engine_id"))
+            for rank, entry in (data or {}).items()
+            if entry.get("engine_id")
+        }
+        if engine_ids:
+            _ENGINE_IDS.clear()
+            _ENGINE_IDS.update(engine_ids)
+            print(
+                f"[layerwise-proxy] prefiller ready at {url} "
+                f"dp_size={len(engine_ids)}"
+            )
+            return
+        time.sleep(1.0)
+    print(
+        f"[layerwise-proxy] prefiller {url}/query unavailable; "
+        "decode waits for the /notify callback instead"
+    )
+
+
+def _decode_params_from_local(transfer_id: str) -> dict | None:
+    """Decode 参数直接用预取的 engine id 拼出来，无需等 Prefill。"""
+    engine_id = _ENGINE_IDS.get(0)
+    if not engine_id:
+        return None
+    return {
+        "do_remote_prefill": True,
+        "do_remote_decode": False,
+        "transfer_id": transfer_id,
+        "remote_engine_id": engine_id,
+        "remote_bootstrap_addr": _bootstrap_addr({}),
+    }
 
 
 def _run_prefill(body: dict, transfer_id: str, request_path: str) -> None:
@@ -222,25 +275,35 @@ class _Handler(BaseHTTPRequestHandler):
             daemon=True,
             name=f"prefill-{transfer_id[:8]}",
         ).start()
-        notified = _wait_for_prefill(slot, transfer_id)
-        params = None
-        if notified and slot.get("payload"):
-            params = _decode_params_from_notify(slot["payload"], transfer_id)
+        # Prefill 的 engine id 启动时就已知，Decode 不必等 Prefill 响应或 notify。
+        params = _decode_params_from_local(transfer_id)
+        if params is not None:
             print(
-                "[layerwise-proxy] early decode transfer_id="
+                "[layerwise-proxy] concurrent decode transfer_id="
                 f"{transfer_id} engine={params.get('remote_engine_id')}"
             )
         else:
-            slot["prefill_done"].wait()
-            prefill = slot.get("prefill") or {}
-            if _prefill_failed(prefill):
-                message = json.dumps(
-                    {"error": "Prefill request failed", "prefill": prefill}
-                ).encode("utf-8")
-                self._write(502, message, "application/json")
-                return
-            params = _decode_params_from_prefill(prefill, transfer_id)
-            print("[layerwise-proxy] fallback after prefill transfer_id=" f"{transfer_id}")
+            notified = _wait_for_prefill(slot, transfer_id)
+            if notified and slot.get("payload"):
+                params = _decode_params_from_notify(slot["payload"], transfer_id)
+                print(
+                    "[layerwise-proxy] early decode transfer_id="
+                    f"{transfer_id} engine={params.get('remote_engine_id')}"
+                )
+            else:
+                slot["prefill_done"].wait()
+                prefill = slot.get("prefill") or {}
+                if _prefill_failed(prefill):
+                    message = json.dumps(
+                        {"error": "Prefill request failed", "prefill": prefill}
+                    ).encode("utf-8")
+                    self._write(502, message, "application/json")
+                    return
+                params = _decode_params_from_prefill(prefill, transfer_id)
+                print(
+                    "[layerwise-proxy] fallback after prefill transfer_id="
+                    f"{transfer_id}"
+                )
         if not params or not params.get("remote_engine_id"):
             message = json.dumps(
                 {
@@ -285,10 +348,12 @@ def main() -> None:
     _PROXY_PORT = args.port
     _NOTIFY_HOST = args.notify_host
     _PREFILL_HOST = urlparse(_PREFILL_URL).hostname or "127.0.0.1"
+    _discover_prefiller()
     server = ThreadingHTTPServer(("0.0.0.0", args.port), _Handler)
     print(
         "[layerwise-proxy] listen"
         f" 0.0.0.0:{args.port} prefill={_PREFILL_URL} decode={_DECODE_URL}"
+        f" engine_ids={len(_ENGINE_IDS)}"
     )
     server.serve_forever()
 

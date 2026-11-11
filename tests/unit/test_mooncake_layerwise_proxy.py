@@ -35,9 +35,11 @@ def _slot():
 class LayerwiseProxyTest(unittest.TestCase):
     def setUp(self):
         proxy._PENDING.clear()
+        proxy._ENGINE_IDS.clear()
 
     def tearDown(self):
         proxy._PENDING.clear()
+        proxy._ENGINE_IDS.clear()
 
     def test_benchmark_prefill_is_valid_and_client_request_is_preserved(self):
         for limit in ("max_tokens", "max_completion_tokens"):
@@ -69,6 +71,55 @@ class LayerwiseProxyTest(unittest.TestCase):
                 self.assertTrue(decode_body["stream"])
                 self.assertEqual(decode_body[limit], 16)
                 self.assertEqual(decode_body["stream_options"], body["stream_options"])
+
+    def test_discovered_engine_ids_let_decode_start_without_waiting(self):
+        proxy._ENGINE_IDS[0] = "test-engine"
+        params = proxy._decode_params_from_local("test-transfer")
+        self.assertEqual(params["remote_engine_id"], "test-engine")
+        self.assertTrue(params["do_remote_prefill"])
+        self.assertFalse(params["do_remote_decode"])
+        self.assertEqual(params["transfer_id"], "test-transfer")
+        self.assertTrue(params["remote_bootstrap_addr"].endswith(":8998"))
+
+        # Prefill stays blocked; decode must still be forwarded immediately.
+        handler = object.__new__(proxy._Handler)
+        handler._write = Mock()
+        blocked = threading.Event()
+
+        def start_thread(*, target, args, **kwargs):
+            return Mock(start=blocked.set)
+
+        with (
+            patch.object(proxy.threading, "Thread", side_effect=start_thread),
+            patch.object(proxy, "_forward_decode") as decode,
+            patch.object(proxy._Handler, "_write_stream"),
+            patch.object(proxy, "_wait_for_prefill") as wait,
+            patch.object(proxy.httpx, "post"),
+        ):
+            decode.return_value.__enter__.return_value.iter_bytes.return_value = []
+            handler._handle_request({"stream": True}, "/v1/chat/completions")
+        decode.assert_called_once()
+        self.assertEqual(
+            decode.call_args.args[1]["remote_engine_id"], "test-engine"
+        )
+        wait.assert_not_called()
+        self.assertTrue(blocked.is_set())
+
+    def test_discover_prefiller_reads_engine_ids_from_query(self):
+        response = httpx.Response(
+            200,
+            json={"0": {"engine_id": "eng-a"}, "1": {"engine_id": "eng-b"}},
+            request=httpx.Request("GET", "http://127.0.0.1:8998/query"),
+        )
+        with patch.object(proxy.httpx, "get", return_value=response):
+            proxy._discover_prefiller(timeout_s=0.1)
+        self.assertEqual(proxy._ENGINE_IDS, {0: "eng-a", 1: "eng-b"})
+
+    def test_discover_prefiller_gives_up_and_keeps_notify_fallback(self):
+        with patch.object(proxy.httpx, "get", side_effect=httpx.ConnectError("x")):
+            proxy._discover_prefiller(timeout_s=0.0)
+        self.assertEqual(proxy._ENGINE_IDS, {})
+        self.assertIsNone(proxy._decode_params_from_local("test-transfer"))
 
     def test_prefill_error_wakes_without_notify_timeout(self):
         slot = _slot()
