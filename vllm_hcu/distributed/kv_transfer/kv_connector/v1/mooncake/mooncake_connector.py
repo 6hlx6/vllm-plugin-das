@@ -1148,6 +1148,9 @@ class MooncakeXferResponse(
     err_msg: str | None = None
     # Layer indices finished in this batch. FINISH still ends the transfer.
     ready_layers: list[int] | None = None
+    # Decode request ids this batch belongs to. One handshake can carry
+    # several requests; without this, every request would take the layers.
+    ready_reqs: list[ReqId] | None = None
 
 
 @dataclass
@@ -3074,6 +3077,7 @@ class MooncakeConnectorWorker:
         identity: bytes,
         sock: zmq.asyncio.Socket,
         layers: list[int],
+        req_ids: list[ReqId] | None = None,
     ) -> None:
         """Tell Decode these layers are written. FINISH is still sent last."""
         if not layers or not _layerwise_decode_scheme_enabled():
@@ -3081,6 +3085,7 @@ class MooncakeConnectorWorker:
         response = MooncakeXferResponse(
             status=MooncakeXferResponseStatus.CONTINUE,
             ready_layers=[int(layer) for layer in layers],
+            ready_reqs=list(req_ids) if req_ids else None,
         )
         await sock.send_multipart((identity, self._encoder.encode(response)))
 
@@ -3129,8 +3134,12 @@ class MooncakeConnectorWorker:
                                 or session["send_meta"].p_req_id,
                             )
                             try:
+                                req_id = session.get("d_req_id")
                                 await self._notify_decode_layers_ready(
-                                    identity, sock, layers
+                                    identity,
+                                    sock,
+                                    layers,
+                                    [req_id] if req_id else None,
                                 )
                             except Exception as exc:
                                 session["errors"].append(
@@ -3708,12 +3717,24 @@ class MooncakeConnectorWorker:
         cv = getattr(self, "_layerwise_recv_cv", None)
         if cv is None:
             return
+        # ready_reqs names the requests in this batch. Absent means the old
+        # single-request message: every request on this handshake.
+        ready_reqs = getattr(response, "ready_reqs", None)
+        if ready_reqs:
+            wanted = set(ready_reqs)
+            targets = [
+                meta for meta in pull_metas.values() if meta.d_req_id in wanted
+            ]
+            if not targets:
+                return
+        else:
+            targets = list(pull_metas.values())
         expected = {
             int(index)
             for index in (getattr(self, "registered_layer_indices", None) or [])
         }
         with cv:
-            for pull_meta in pull_metas.values():
+            for pull_meta in targets:
                 req_id = pull_meta.d_req_id
                 if req_id in self._layerwise_recv_complete:
                     continue

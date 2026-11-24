@@ -442,8 +442,9 @@ class LayerwiseLifecycleTest(unittest.IsolatedAsyncioTestCase):
 
         notified = []
 
-        async def notify(_identity, _sock, layers):
+        async def notify(_identity, _sock, layers, req_ids=None):
             notified.append(list(layers))
+            self.assertEqual(list(req_ids or []), ["decode-req"])
 
         async def flush():
             return None
