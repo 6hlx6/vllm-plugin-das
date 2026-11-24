@@ -231,10 +231,22 @@ def apply_to_module(module: ModuleType) -> bool:
         output_shape=None,
         q_dcp_replicated=None,
     ):
+        from vllm_hcu.patch.worker.core_fix.patch_deepseek_v4_attention import (
+            _notify_mooncake_layer_computed,
+        )
+
+        def _return_after_kv(output):
+            # KV was written above. Record the event so this layer can be
+            # sent while later layers are still running.
+            _notify_mooncake_layer_computed(self)
+            return output
+
         # Keep the official path unchanged when PCP/layer split is inactive.
         if not getattr(self, "_hcu_use_pcp", False):
-            return original_full_forward(
-                self, q, kv_c_normed, k_pe, output_shape, q_dcp_replicated
+            return _return_after_kv(
+                original_full_forward(
+                    self, q, kv_c_normed, k_pe, output_shape, q_dcp_replicated
+                )
             )
         from vllm_hcu.model_executor.layers.attention.pcp import (
             in_replicated_mtp_batch,
@@ -243,8 +255,10 @@ def apply_to_module(module: ModuleType) -> bool:
         # MTP/draft batches are replicated and must use the official writer;
         # entering the layer-split collective here would deadlock PCP ranks.
         if in_replicated_mtp_batch():
-            return original_full_forward(
-                self, q, kv_c_normed, k_pe, output_shape, q_dcp_replicated
+            return _return_after_kv(
+                original_full_forward(
+                    self, q, kv_c_normed, k_pe, output_shape, q_dcp_replicated
+                )
             )
 
         from vllm_hcu.v1.dsa_cache_layer_split import (
@@ -267,9 +281,10 @@ def apply_to_module(module: ModuleType) -> bool:
             )
 
             with pcp_cache_ownership_scope(attn_metadata):
-                return original_full_forward(
+                output = original_full_forward(
                     self, q, kv_c_normed, k_pe, output_shape, q_dcp_replicated
                 )
+            return _return_after_kv(output)
 
         forward_context = get_forward_context()
         attn_metadata_raw = forward_context.attn_metadata
@@ -360,7 +375,7 @@ def apply_to_module(module: ModuleType) -> bool:
             output=output,
             q_dcp_replicated=q_dcp_replicated,
         )
-        return output
+        return _return_after_kv(output)
 
     @functools.wraps(original_forward)
     def hcu_forward(self, q, k_c_normed, k_pe, kv_cache, attn_metadata, output,
