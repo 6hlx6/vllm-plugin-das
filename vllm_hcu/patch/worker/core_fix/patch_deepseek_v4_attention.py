@@ -245,6 +245,33 @@ def _layerwise_kv_names(layer: torch.nn.Module) -> list[str]:
     return unique
 
 
+def _wait_mooncake_layer_load(layer: torch.nn.Module) -> None:
+    """Wait for this layer's remote KV before reading it.
+
+    Returns immediately on Prefill, during CUDA graph capture, or when the scheme is off.
+    """
+    try:
+        if torch.cuda.is_current_stream_capturing():
+            return
+    except Exception:
+        return
+    try:
+        from vllm.distributed.kv_transfer import (
+            get_kv_transfer_group,
+            has_kv_transfer_group,
+        )
+    except Exception:
+        return
+    if not has_kv_transfer_group():
+        return
+    wait = getattr(get_kv_transfer_group(), "wait_for_layer_load", None)
+    if wait is None:
+        return
+    name = getattr(layer, "layer_name", None) or getattr(layer, "prefix", None)
+    if name:
+        wait(name)
+
+
 def _notify_mooncake_layer_computed(layer: torch.nn.Module) -> None:
     """Notify Mooncake after this layer's KV is written.
 
@@ -534,6 +561,9 @@ def apply_to_module(module: ModuleType) -> bool:
         # uint8 LightOp insert owns KVNorm itself, so keep KV raw here and let
         # the insert wrapper normalize it only for official non-uint8 caches.
         del llama_4_scaling
+        # Wait for this layer's remote KV before attention reads it.
+        # Steady FULL-graph replay does not enter this function.
+        _wait_mooncake_layer_load(self)
         num_tokens = hidden_states.shape[0]
         o_padded = torch.empty(
             (num_tokens, self.padded_heads, self.head_dim),

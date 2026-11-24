@@ -1291,6 +1291,9 @@ class DeepseekV2MLAAttention(nn.Module):
             self.indexer_rope_emb = None
             self.indexer = None
 
+        # Layer index for the decode-side KV wait. Compute does not use this.
+        self.prefix = prefix
+
         mla_modules = MLAModules(
             kv_a_layernorm=self.kv_a_layernorm,
             kv_b_proj=self.kv_b_proj,
@@ -1333,6 +1336,15 @@ class DeepseekV2MLAAttention(nn.Module):
         hidden_states: torch.Tensor,
         llama_4_scaling: torch.Tensor | None,
     ) -> torch.Tensor:
+        # Wait for this layer's KV, including the indexer, before reading it.
+        # The helper returns immediately on Prefill, when the scheme is off,
+        # or while a CUDA graph is being captured.
+        from vllm_hcu.patch.worker.core_fix.patch_deepseek_v4_attention import (
+            _wait_mooncake_layer_load,
+        )
+
+        _wait_mooncake_layer_load(self)
+        # KV notify stays in the MLA forward, immediately after the cache write.
         return self.mla_attn(positions, hidden_states, llama_4_scaling)
 
 
