@@ -4291,6 +4291,21 @@ class GPUModelRunner(
             # Mark KV scales as calculated after the first forward pass
             self.calculate_kv_scales = False
 
+        # Per-layer wait cannot sit inside a FULL graph. Leave this step on FULL
+        # unless VLLM_HCU_MOONCAKE_LAYERWISE_D_EAGER_WAIT=1, which drops only the
+        # waiting step to eager and lets the next step return to FULL.
+        if has_kv_transfer_group():
+            blocks_graph = getattr(
+                get_kv_transfer_group(), "layerwise_decode_blocks_graph", None
+            )
+            scheduled_ids = getattr(scheduler_output, "num_scheduled_tokens", None)
+            if (
+                blocks_graph is not None
+                and scheduled_ids
+                and blocks_graph(scheduled_ids)
+            ):
+                cudagraph_mode = CUDAGraphMode.NONE
+
         # Encoder-decoder models can only compile the pure decode steps where no
         # encoder inputs are present. Use eager for the first pass.
         num_encoder_reqs = len(scheduler_output.scheduled_encoder_inputs)

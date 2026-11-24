@@ -361,6 +361,10 @@ def _record_kv_ready_event():
 _LAYERWISE_SEND_GROUP = 8
 _LAYERWISE_MAX_LAYERS_ENV = "VLLM_HCU_MOONCAKE_LAYERWISE_MAX_LAYERS"
 _LAYERWISE_DECODE_ENV = "VLLM_HCU_MOONCAKE_LAYERWISE_DECODE"
+_LAYERWISE_D_LATE_ENV = "VLLM_HCU_MOONCAKE_LAYERWISE_D_LATE_LAYERS"
+_LAYERWISE_D_STEP_MS_ENV = "VLLM_HCU_MOONCAKE_LAYERWISE_D_STEP_MS"
+_LAYERWISE_D_SLACK_MS_ENV = "VLLM_HCU_MOONCAKE_LAYERWISE_D_SLACK_MS"
+_LAYERWISE_D_EAGER_WAIT_ENV = "VLLM_HCU_MOONCAKE_LAYERWISE_D_EAGER_WAIT"
 
 
 def _layerwise_send_limits() -> tuple[int, int | None]:
@@ -397,14 +401,132 @@ def _layerwise_send_limits() -> tuple[int, int | None]:
 
 
 def _layerwise_decode_scheme_enabled() -> bool:
-    """Both processes set this before Prefill reports each finished layer.
+    """Decode-side layerwise switch. Both processes must set it to 1.
 
-    Unset keeps the bulk FINISH. Per-layer CONTINUE is what lets Decode start early.
+    When on, Decode's first forward is the client's first output token. It stays
+    on the FULL graph and starts once the in-flight tail fits in that step.
+    Unset keeps the bulk wait.
     """
     raw = os.environ.get(_LAYERWISE_DECODE_ENV, "").strip().lower()
     return raw in {"1", "true", "yes", "on"}
 
 
+def _layerwise_decode_late_remaining(total: int) -> int | None:
+    """Explicit remaining-layer override, or None when it is unset.
+
+    Zero waits for every layer. A positive value is capped at total. Unset
+    lets the FULL-graph estimate choose the point.
+    """
+    if total <= 0:
+        return 0
+    raw = os.environ.get(_LAYERWISE_D_LATE_ENV, "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = int(raw)
+    except ValueError:
+        parsed = -1
+    if parsed >= 0:
+        return min(parsed, total)
+    logger.warning(
+        "%s=%r is not a non-negative integer; waiting for the FULL-graph estimate",
+        _LAYERWISE_D_LATE_ENV,
+        raw,
+    )
+    return None
+
+
+def _layerwise_decode_eager_wait() -> bool:
+    """Old path: the waiting step runs eager and waits inside each layer."""
+    raw = os.environ.get(_LAYERWISE_D_EAGER_WAIT_ENV, "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _layerwise_decode_step_ms() -> float | None:
+    """FULL-graph time for one decode token. Unset means do not start early."""
+    raw = os.environ.get(_LAYERWISE_D_STEP_MS_ENV, "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = float(raw)
+    except ValueError:
+        parsed = 0.0
+    if parsed <= 0:
+        logger.warning(
+            "%s=%r is not a positive number; the FULL forward waits for every layer",
+            _LAYERWISE_D_STEP_MS_ENV,
+            raw,
+        )
+        return None
+    return parsed
+
+
+def _layerwise_decode_slack_ms() -> float:
+    """Milliseconds of RDMA slack kept on the last layer. Default 50."""
+    raw = os.environ.get(_LAYERWISE_D_SLACK_MS_ENV, "").strip()
+    if not raw:
+        return 50.0
+    try:
+        parsed = float(raw)
+    except ValueError:
+        parsed = -1.0
+    if parsed >= 0:
+        return parsed
+    logger.warning(
+        "%s=%r is not a non-negative number; using 50ms",
+        _LAYERWISE_D_SLACK_MS_ENV,
+        raw,
+    )
+    return 50.0
+
+
+def _layerwise_layer_ms(arrived: dict[int, float]) -> float | None:
+    """Slowest observed milliseconds per layer between two arrival batches.
+
+    The first packets are often a backlog dump, so a short window is not
+    Prefill's pace. Ignore the samples until the first and last batch are at
+    least one FULL step apart. A fast gap that really lasts that long has
+    already delivered most layers, and the tail still fits in the step.
+    """
+    if len(arrived) < 2:
+        return None
+    batches: dict[float, int] = {}
+    for ts in arrived.values():
+        batches[ts] = batches.get(ts, 0) + 1
+    ordered = sorted(batches.items())
+    if len(ordered) < 2:
+        return None
+    slowest = 0.0
+    for (t0, _), (t1, count) in zip(ordered, ordered[1:]):
+        if count <= 0 or t1 <= t0:
+            continue
+        slowest = max(slowest, (t1 - t0) * 1000.0 / count)
+    if slowest <= 0:
+        return None
+    step_ms = _layerwise_decode_step_ms()
+    if step_ms is not None:
+        span_ms = (ordered[-1][0] - ordered[0][0]) * 1000.0
+        if span_ms < step_ms:
+            return None
+    return slowest
+
+
+def _layerwise_full_graph_remaining(total: int, layer_ms: float | None) -> int:
+    """In-flight layers that still fit inside one FULL decode step.
+
+    The graph cannot wait. It may start only while
+    step_ms - remaining * layer_ms stays at least the slack. Missing step time
+    or arrival samples waits for every layer.
+    """
+    if total <= 0 or layer_ms is None or layer_ms <= 0:
+        return 0
+    step_ms = _layerwise_decode_step_ms()
+    if step_ms is None:
+        return 0
+    budget = step_ms - _layerwise_decode_slack_ms()
+    if budget <= 0:
+        return 0
+    return max(0, min(int(budget // layer_ms), total))
 
 def _expand_transfer_regions(
     base_addrs: list[int],
@@ -1037,7 +1159,12 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
 
     @classmethod
     def requires_piecewise_for_cudagraph(cls, extra_config: dict[str, Any]) -> bool:
-        """Layerwise Python sync points require PIECEWISE graphs when enabled."""
+        """Layerwise Python sync points require PIECEWISE graphs when enabled.
+
+        The decode-side scheme returns False so steady decode stays on FULL.
+        The waiting step is also FULL unless VLLM_HCU_MOONCAKE_LAYERWISE_D_EAGER_WAIT
+        is set, in which case the runner drops only that step to eager.
+        """
         extra_config = extra_config or {}
         if "layerwise" in extra_config:
             enabled = _layerwise_flag_enabled(extra_config.get("layerwise"))
@@ -1047,7 +1174,31 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
                 enabled = _layerwise_flag_enabled(raw)
             else:
                 enabled = bool(getattr(henvs, "VLLM_HCU_MOONCAKE_LAYERWISE", False))
-        return bool(enabled)
+        if not enabled:
+            return False
+        if _layerwise_decode_scheme_enabled():
+            return False
+        return True
+
+    def wait_for_layer_load(self, layer_name: str) -> None:
+        """Return immediately when the scheme is off. Otherwise wait for this layer."""
+        worker = self.connector_worker
+        if worker is None:
+            return
+        wait = getattr(worker, "wait_for_layer_load", None)
+        if wait is None:
+            return
+        wait(layer_name)
+
+    def layerwise_decode_blocks_graph(self, req_ids: Any) -> bool:
+        """True when this step still has a request waiting on per-layer KV."""
+        worker = self.connector_worker
+        if worker is None:
+            return False
+        blocked = getattr(worker, "layerwise_decode_blocks_graph", None)
+        if blocked is None:
+            return False
+        return bool(blocked(req_ids))
 
     def save_kv_layer(
         self,
@@ -1173,7 +1324,12 @@ class MooncakeConnectorScheduler:
 
     def _get_remote_prefill_token_count(self, num_prompt_tokens: int) -> int:
         """D-side only. Returns N-1 for Mamba models since the decoder
-        always recomputes the last token and must start from h(N-1)."""
+        always recomputes the last token and must start from h(N-1).
+
+        Non-Mamba attention still returns N. The client's TTFT is the first
+        output token, so that step overlaps the remaining prefill layers.
+        N-1 would overlap a prompt recompute and delay the output token.
+        """
         if self._has_mamba and num_prompt_tokens > 1:
             return num_prompt_tokens - 1
         return num_prompt_tokens
@@ -1565,6 +1721,12 @@ class MooncakeConnectorWorker:
 
         self.finished_sending_reqs: set[ReqId] = set()
         self.finished_recving_reqs: set[ReqId] = set()
+        # Per-layer decode progress. The receiver thread writes; forward waits.
+        self._layerwise_recv_cv = threading.Condition()
+        self._layerwise_recv: dict[str, set[int]] = {}
+        self._layerwise_recv_time: dict[str, dict[int, float]] = {}
+        self._layerwise_decode_released: set[str] = set()
+        self._layerwise_recv_complete: set[str] = set()
         self._layerwise_lock = threading.Lock()
         self._layerwise_epoch = 0
         self._layerwise_computed: dict[int, list[tuple[str, Any]]] = {}
@@ -1578,6 +1740,27 @@ class MooncakeConnectorWorker:
             logger.info(
                 "Mooncake layerwise KV enabled on producer: send each layer "
                 "after it is computed; decode waits until every layer arrives."
+            )
+        if _layerwise_decode_scheme_enabled() and self.is_kv_consumer:
+            if _layerwise_decode_eager_wait():
+                logger.info(
+                    "Mooncake layerwise decode: first step waits per layer, "
+                    "later steps stay on FULL graph. Late start env=%s",
+                    _LAYERWISE_D_LATE_ENV,
+                )
+            else:
+                logger.info(
+                    "Mooncake layerwise decode: first step stays on FULL graph "
+                    "and starts when the in-flight tail fits in one step. "
+                    "step_ms=%s slack_ms=%s late_env=%s",
+                    os.environ.get(_LAYERWISE_D_STEP_MS_ENV, ""),
+                    _layerwise_decode_slack_ms(),
+                    os.environ.get(_LAYERWISE_D_LATE_ENV, ""),
+                )
+        if self.layerwise_enabled and _layerwise_decode_scheme_enabled():
+            logger.info(
+                "Mooncake layerwise decode scheme: decode's first forward is "
+                "the output token and overlaps the remaining prefill layers."
             )
 
         self.xfer_stats = MooncakeKVConnectorStats()
@@ -3267,11 +3450,157 @@ class MooncakeConnectorWorker:
             self.xfer_stats.record_failed_recv()
             return
 
+    def _note_layerwise_decode_progress(
+        self,
+        response: MooncakeXferResponse,
+        pull_metas: dict[ReqId, PullReqMeta],
+    ) -> None:
+        """Record arrived layers. Release the first forward once few remain."""
+        if not _layerwise_decode_scheme_enabled() or not self.is_kv_consumer:
+            return
+        layers = response.ready_layers or []
+        if not layers:
+            return
+        cv = getattr(self, "_layerwise_recv_cv", None)
+        if cv is None:
+            return
+        expected = {
+            int(index)
+            for index in (getattr(self, "registered_layer_indices", None) or [])
+        }
+        with cv:
+            for pull_meta in pull_metas.values():
+                req_id = pull_meta.d_req_id
+                if req_id in self._layerwise_recv_complete:
+                    continue
+                got = self._layerwise_recv.setdefault(req_id, set())
+                got.update(int(layer) for layer in layers)
+                times = self._layerwise_recv_time.setdefault(req_id, {})
+                now = time.monotonic()
+                for layer in layers:
+                    times.setdefault(int(layer), now)
+                if not expected or req_id in self._layerwise_decode_released:
+                    continue
+                remaining = len(expected - got)
+                explicit = _layerwise_decode_late_remaining(len(expected))
+                layer_ms = None
+                if explicit is None:
+                    layer_ms = _layerwise_layer_ms(times)
+                    late = _layerwise_full_graph_remaining(len(expected), layer_ms)
+                else:
+                    late = explicit
+                    if not getattr(self, "_layerwise_late_warned", False):
+                        self._layerwise_late_warned = True
+                        logger.warning(
+                            "%s=%s overrides the FULL-graph tail. Unset it and set "
+                            "%s to the FULL decode step in milliseconds.",
+                            _LAYERWISE_D_LATE_ENV,
+                            explicit,
+                            _LAYERWISE_D_STEP_MS_ENV,
+                        )
+                if remaining <= late:
+                    self._layerwise_decode_released.add(req_id)
+                    self.finished_recving_reqs.add(req_id)
+                    logger.info(
+                        "Mooncake layerwise decode release req_id=%s "
+                        "received=%s total=%s remaining=%s late=%s layer_ms=%s",
+                        req_id,
+                        len(expected & got),
+                        len(expected),
+                        remaining,
+                        late,
+                        layer_ms,
+                    )
+            cv.notify_all()
+
+    def _layerwise_decode_take_finish(self, d_req_id: ReqId) -> bool:
+        """On FINISH, True if the scheduler still needs a completion report."""
+        if not _layerwise_decode_scheme_enabled():
+            return True
+        cv = getattr(self, "_layerwise_recv_cv", None)
+        if cv is None:
+            return True
+        with cv:
+            already = d_req_id in self._layerwise_decode_released
+            self._layerwise_recv_complete.add(d_req_id)
+            self._layerwise_decode_released.discard(d_req_id)
+            self._layerwise_recv.pop(d_req_id, None)
+            recv_time = getattr(self, "_layerwise_recv_time", None)
+            if recv_time is not None:
+                recv_time.pop(d_req_id, None)
+            cv.notify_all()
+            return not already
+
+    def wait_for_layer_load(self, layer_name: str) -> None:
+        """Block until this layer arrives for a released request. Steady requests return.
+
+        The FULL-graph step must not wait inside the forward: a per-layer wait
+        keeps the step in Python and holds it until Prefill finishes. Set
+        VLLM_HCU_MOONCAKE_LAYERWISE_D_EAGER_WAIT=1 to keep that old path.
+        """
+        if not _layerwise_decode_scheme_enabled() or not self.is_kv_consumer:
+            return
+        if not _layerwise_decode_eager_wait():
+            return
+        cv = getattr(self, "_layerwise_recv_cv", None)
+        if cv is None:
+            return
+        try:
+            index = extract_layer_index(layer_name)
+        except Exception:
+            return
+        timeout = float(getattr(envs, "VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT", 300) or 300)
+        deadline = time.monotonic() + timeout
+        with cv:
+            while True:
+                pending = [
+                    req_id
+                    for req_id in self._layerwise_decode_released
+                    if req_id not in self._layerwise_recv_complete
+                    and index not in self._layerwise_recv.get(req_id, set())
+                ]
+                if not pending:
+                    return
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        "Mooncake layerwise decode timed out waiting for "
+                        f"layer {index}, reqs={pending}"
+                    )
+                cv.wait(timeout=remaining)
+
+    def layerwise_decode_blocks_graph(self, req_ids: Any) -> bool:
+        """True when this step must leave the FULL graph to wait per layer.
+
+        Default is False: the first token runs as a FULL graph after enough
+        layers have arrived. VLLM_HCU_MOONCAKE_LAYERWISE_D_EAGER_WAIT=1 keeps
+        the old eager step.
+        """
+        if not _layerwise_decode_eager_wait():
+            return False
+        if not _layerwise_decode_scheme_enabled() or not self.is_kv_consumer:
+            return False
+        cv = getattr(self, "_layerwise_recv_cv", None)
+        if cv is None:
+            return False
+        with cv:
+            for req_id in req_ids:
+                if (
+                    req_id in self._layerwise_decode_released
+                    and req_id not in self._layerwise_recv_complete
+                ):
+                    return True
+        return False
+
     def process_pulling_result(
         self,
         response: MooncakeXferResponse,
         pull_metas: dict[ReqId, PullReqMeta],
     ):
+        if response.status == MooncakeXferResponseStatus.CONTINUE:
+            self._note_layerwise_decode_progress(response, pull_metas)
+            return
+
         ok_reqs: list[ReqId] = response.ok_reqs or []
         err_reqs: list[ReqId] = response.err_reqs or []
 
@@ -3280,7 +3609,9 @@ class MooncakeConnectorWorker:
             # No race because we are in async loop.
             pull_meta.pull_tasks_count -= 1
             if pull_meta.pull_tasks_count == 0:
-                self.finished_recving_reqs.add(pull_meta.d_req_id)
+                # Skip a second completion report if this request was released early.
+                if self._layerwise_decode_take_finish(pull_meta.d_req_id):
+                    self.finished_recving_reqs.add(pull_meta.d_req_id)
                 log_ttft_event(
                     "d_kv_ready",
                     transfer_id=pull_meta.transfer_id,
