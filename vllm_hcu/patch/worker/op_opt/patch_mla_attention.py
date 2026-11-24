@@ -231,8 +231,12 @@ def apply_to_module(module: ModuleType) -> bool:
         output_shape=None,
         q_dcp_replicated=None,
     ):
+        # Same per-layer wait as DeepseekV2MLAAttention, using this layer_name
+        # so the index matches save_kv_layer. Returns immediately when the
+        # scheme is off, on Prefill, or while capturing a CUDA graph.
         from vllm_hcu.patch.worker.core_fix.patch_deepseek_v4_attention import (
             _notify_mooncake_layer_computed,
+            _wait_mooncake_layer_load,
         )
 
         def _return_after_kv(output):
@@ -241,6 +245,7 @@ def apply_to_module(module: ModuleType) -> bool:
             _notify_mooncake_layer_computed(self)
             return output
 
+        _wait_mooncake_layer_load(self)
         # Keep the official path unchanged when PCP/layer split is inactive.
         if not getattr(self, "_hcu_use_pcp", False):
             return _return_after_kv(

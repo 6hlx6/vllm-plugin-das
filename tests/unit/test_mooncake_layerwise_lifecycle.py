@@ -389,6 +389,52 @@ class LayerwiseLifecycleTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.batches, [])
         self.assertEqual(session["errors"], ["invalid blocks"])
 
+    def test_decode_scheme_stays_off_unless_requested(self):
+        runtime = _load_lifecycle()
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("VLLM_HCU_MOONCAKE_LAYERWISE_DECODE", None)
+            os.environ.pop("VLLM_HCU_MOONCAKE_LAYERWISE_D_LATE_LAYERS", None)
+            os.environ.pop("VLLM_HCU_MOONCAKE_LAYERWISE_D_STEP_MS", None)
+            os.environ.pop("VLLM_HCU_MOONCAKE_LAYERWISE_D_SLACK_MS", None)
+            os.environ.pop("VLLM_HCU_MOONCAKE_LAYERWISE_D_EAGER_WAIT", None)
+            self.assertFalse(runtime._layerwise_decode_scheme_enabled())
+            self.assertFalse(runtime._layerwise_decode_eager_wait())
+            # Unset does not start early. A FULL graph with no step time waits
+            # for every layer.
+            self.assertIsNone(runtime._layerwise_decode_late_remaining(46))
+            self.assertEqual(runtime._layerwise_decode_late_remaining(0), 0)
+            self.assertEqual(runtime._layerwise_full_graph_remaining(78, 21.0), 0)
+        with patch.dict(os.environ, {
+            "VLLM_HCU_MOONCAKE_LAYERWISE_D_LATE_LAYERS": "0",
+        }):
+            self.assertEqual(runtime._layerwise_decode_late_remaining(46), 0)
+        with patch.dict(os.environ, {
+            "VLLM_HCU_MOONCAKE_LAYERWISE_DECODE": "1",
+            "VLLM_HCU_MOONCAKE_LAYERWISE_D_STEP_MS": "349",
+            "VLLM_HCU_MOONCAKE_LAYERWISE_D_SLACK_MS": "50",
+        }):
+            self.assertTrue(runtime._layerwise_decode_scheme_enabled())
+            # 21ms/layer and a 349ms step leave 14 layers in flight:
+            # 349 - 14*21 = 55ms, still above the 50ms slack.
+            self.assertEqual(runtime._layerwise_full_graph_remaining(78, 21.0), 14)
+            self.assertEqual(runtime._layerwise_full_graph_remaining(78, None), 0)
+            # Two batches 40ms apart are a backlog dump. The window is shorter
+            # than the 349ms step, so it must not be used as Prefill's pace.
+            burst = {}
+            for batch, start in enumerate((0.0, 0.040)):
+                for offset in range(8):
+                    burst[batch * 8 + offset] = start
+            self.assertIsNone(runtime._layerwise_layer_ms(burst))
+            arrived = {}
+            for batch, start in enumerate((0.0, 0.168, 0.336, 0.504)):
+                for offset in range(8):
+                    arrived[batch * 8 + offset] = start
+            self.assertAlmostEqual(runtime._layerwise_layer_ms(arrived), 21.0)
+        with patch.dict(os.environ, {
+            "VLLM_HCU_MOONCAKE_LAYERWISE_D_EAGER_WAIT": "1",
+        }):
+            self.assertTrue(runtime._layerwise_decode_eager_wait())
+
     async def test_continue_is_sent_before_prefill_ready(self):
         # The first group must be reported while a later group is still absent.
         # Stopping the drain is what prefill ready used to wait for.
