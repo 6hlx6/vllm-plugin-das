@@ -182,25 +182,40 @@ def apply_to_module(module: ModuleType) -> bool:
         k_pe,
         output_shape=None,
     ):
+        from vllm_hcu.patch.worker.core_fix.patch_deepseek_v4_attention import (
+            _notify_mooncake_layer_computed,
+        )
+
+        def _return_after_kv(output):
+            # KV was written above. Record the event so this layer can be
+            # sent while later layers are still running.
+            _notify_mooncake_layer_computed(self)
+            return output
+
+        # Keep the official path unchanged when PCP/layer split is inactive.
         if not getattr(self, "_hcu_use_pcp", False):
-            return original_full_forward(
-                self,
-                q,
-                kv_c_normed,
-                k_pe,
-                output_shape,
+            return _return_after_kv(
+                original_full_forward(
+                    self,
+                    q,
+                    kv_c_normed,
+                    k_pe,
+                    output_shape,
+                )
             )
         from vllm_hcu.model_executor.layers.attention.pcp import (
             in_replicated_mtp_batch,
         )
 
         if in_replicated_mtp_batch():
-            return original_full_forward(
-                self,
-                q,
-                kv_c_normed,
-                k_pe,
-                output_shape,
+            return _return_after_kv(
+                original_full_forward(
+                    self,
+                    q,
+                    kv_c_normed,
+                    k_pe,
+                    output_shape,
+                )
             )
 
         if self.calculate_kv_scales:
@@ -270,7 +285,7 @@ def apply_to_module(module: ModuleType) -> bool:
             attn_metadata,
             output=output,
         )
-        return output
+        return _return_after_kv(output)
 
     @functools.wraps(original_forward)
     def hcu_forward(self, q, k_c_normed, k_pe, kv_cache, attn_metadata, output,
