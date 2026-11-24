@@ -208,6 +208,70 @@ def _bf16_indexer_q_rope(
     return rotated, scaled_weights
 
 
+def _layerwise_kv_names(layer: torch.nn.Module) -> list[str]:
+    """Registered KV-cache names for this layer.
+
+    This is vLLM's DeepseekV4Attention, not the plugin copy. Mooncake matches
+    regions by registered name. SWA, MLA, and indexer share a layer index, so
+    notify every name that is present.
+    """
+    names: list[str] = []
+    prefix = getattr(layer, "prefix", None)
+    if prefix:
+        names.append(prefix)
+    swa = getattr(layer, "swa_cache_layer", None)
+    swa_prefix = getattr(swa, "prefix", None)
+    if swa_prefix:
+        names.append(swa_prefix)
+    mla = getattr(layer, "mla_attn", None)
+    mla_prefix = getattr(mla, "prefix", None)
+    if mla_prefix:
+        names.append(mla_prefix)
+    indexer = getattr(layer, "indexer", None)
+    k_cache = getattr(indexer, "k_cache", None) if indexer is not None else None
+    k_cache_prefix = getattr(k_cache, "prefix", None)
+    if k_cache_prefix:
+        names.append(k_cache_prefix)
+    layer_name = getattr(layer, "layer_name", None)
+    if layer_name:
+        names.append(layer_name)
+    unique: list[str] = []
+    seen: set[str] = set()
+    for name in names:
+        if name in seen:
+            continue
+        seen.add(name)
+        unique.append(name)
+    return unique
+
+
+def _notify_mooncake_layer_computed(layer: torch.nn.Module) -> None:
+    """Notify Mooncake after this layer's KV is written.
+
+    Returns immediately when layerwise is off or a CUDA graph is being captured.
+    """
+    try:
+        if torch.cuda.is_current_stream_capturing():
+            return
+    except Exception:
+        return
+    try:
+        from vllm.distributed.kv_transfer import (
+            get_kv_transfer_group,
+            has_kv_transfer_group,
+        )
+    except Exception:
+        return
+    if not has_kv_transfer_group():
+        return
+    connector = get_kv_transfer_group()
+    save_kv_layer = getattr(connector, "save_kv_layer", None)
+    if save_kv_layer is None:
+        return
+    for name in _layerwise_kv_names(layer):
+        save_kv_layer(name, None, None)
+
+
 def apply_to_module(module: ModuleType) -> bool:
     attention = load_exact_module(TARGET_MODULE, module)
     cls = require_class(attention, "DeepseekV4Attention", TARGET_SYMBOL)
@@ -497,7 +561,11 @@ def apply_to_module(module: ModuleType) -> bool:
             o_padded,
         )
         output = o_padded[:, : self.n_local_heads, :]
-        return self._o_proj(output, positions)
+        projected = self._o_proj(output, positions)
+        # KV was written in _prepare_and_attn_fn. Long prefills are eager, so
+        # every real step reaches this notify.
+        _notify_mooncake_layer_computed(self)
+        return projected
 
     setattr(hcu_attention_forward, _FORWARD_WRAPPER_MARKER, True)
 

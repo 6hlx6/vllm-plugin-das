@@ -624,6 +624,68 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         )
 
 
+def _layerwise_kv_names(layer: torch.nn.Module) -> list[str]:
+    """Registered KV-cache names for this layer.
+
+    Mooncake matches regions by name. MLA, SWA, and indexer may be separate
+    caches with the same layer index; notifying any registered name sends the
+    finished regions for that layer together.
+    """
+    names: list[str] = []
+    mla = getattr(layer, "mla_attn", None)
+    mla_prefix = getattr(mla, "prefix", None)
+    if mla_prefix:
+        names.append(mla_prefix)
+    swa = getattr(layer, "swa_cache_layer", None)
+    swa_prefix = getattr(swa, "prefix", None)
+    if swa_prefix:
+        names.append(swa_prefix)
+    indexer = getattr(layer, "indexer", None)
+    k_cache = getattr(indexer, "k_cache", None) if indexer is not None else None
+    k_cache_prefix = getattr(k_cache, "prefix", None)
+    if k_cache_prefix:
+        names.append(k_cache_prefix)
+    wrapper_name = getattr(layer, "layer_name", None)
+    if wrapper_name:
+        names.append(wrapper_name)
+    unique: list[str] = []
+    seen: set[str] = set()
+    for name in names:
+        if name in seen:
+            continue
+        seen.add(name)
+        unique.append(name)
+    return unique
+
+
+def _notify_mooncake_layer_computed(layer: torch.nn.Module) -> None:
+    """Notify the connector after this layer's KV is written so prefill can send it.
+
+    Returns immediately when layerwise is off, no connector is set, or a CUDA
+    graph is being captured. save_kv_layer stays a no-op while layerwise is off.
+    """
+    try:
+        if torch.cuda.is_current_stream_capturing():
+            return
+    except Exception:
+        return
+    try:
+        from vllm.distributed.kv_transfer import (
+            get_kv_transfer_group,
+            has_kv_transfer_group,
+        )
+    except Exception:
+        return
+    if not has_kv_transfer_group():
+        return
+    connector = get_kv_transfer_group()
+    save_kv_layer = getattr(connector, "save_kv_layer", None)
+    if save_kv_layer is None:
+        return
+    for name in _layerwise_kv_names(layer):
+        save_kv_layer(name, None, None)
+
+
 def deepseek_v4_attention(
     hidden_states: torch.Tensor,
     positions: torch.Tensor,
@@ -633,6 +695,9 @@ def deepseek_v4_attention(
     forward_context: ForwardContext = get_forward_context()
     self = forward_context.no_compile_layers[layer_name]
     self.attention_impl(hidden_states, positions, out)
+    # Long prefills such as 20480 tokens are eager, so every real step gets here.
+    # CUDA graph replay does not re-enter this function; capture already returned.
+    _notify_mooncake_layer_computed(self)
 
 
 def deepseek_v4_attention_fake(
