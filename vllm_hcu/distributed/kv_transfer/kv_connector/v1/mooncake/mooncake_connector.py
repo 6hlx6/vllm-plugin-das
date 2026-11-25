@@ -3618,7 +3618,13 @@ class MooncakeConnectorWorker:
         response: MooncakeXferResponse,
         pull_metas: dict[ReqId, PullReqMeta],
     ):
-        if response.status == MooncakeXferResponseStatus.CONTINUE:
+        # Bulk handshakes also use CONTINUE, and those carry ok_reqs.
+        # Only a layerwise batch sets ready_layers; leave the others on the
+        # original completion path.
+        if (
+            response.status == MooncakeXferResponseStatus.CONTINUE
+            and response.ready_layers
+        ):
             self._note_layerwise_decode_progress(response, pull_metas)
             return
 
